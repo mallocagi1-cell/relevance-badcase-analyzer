@@ -1,0 +1,53 @@
+# 内置小模型的干跑配置。真实模型把 base_model / ft_model 换成目录即可。
+base_model: tiny
+ft_model: tiny
+model_type: tiny
+
+badcases: examples/badcases.jsonl
+goodcases: examples/goodcases.jsonl
+
+grades: ["-1", "0", "1", "2", "3"]
+image_token: "<|image_pad|>"
+image_seq_len: 4
+input_mode: template
+
+device: cpu
+dtype: float32
+batch_size: 4
+max_length: 256
+output_dir: runs/example
+seed: 0
+plant_error: true
+max_detail_cases: 4
+verify_top_k: 3
+delta_w_top_k: 8
+svd_rank: 2
+token_attr_method: gradxinput
+ig_steps: 2
+chars_per_token: 1.6
+resume: true
+
+llm:
+  base_url: https://api.openai.com/v1
+  model: gpt-4.1
+  api_key_env: OPENAI_API_KEY
+  max_prompt_tokens: 6000
+  temperature: 0.2
+  enabled: true
+
+analyses:
+  logit_lens: true
+  dla: true
+  token_attr: true
+  delta_w: true
+  probes: true
+  cluster: true
+  verify: true
+  llm: true
+
+prompt_template: |
+  判断文档与查询的相关性。只输出一个等级，不要输出其它文字。
+  等级含义：-1 冲突或答非所问，0 不相关，1 弱相关，2 相关，3 高度相关。
+  查询：{query}
+  文档：{doc}
+  {image}相关性等级：

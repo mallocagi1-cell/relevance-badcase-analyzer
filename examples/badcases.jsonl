@@ -1,0 +1,8 @@
+{"id": "b001", "query": "红烧肉怎么做", "doc": "五花肉焯水后加冰糖炒糖色，再放酱油和八角炖四十分钟。", "image": "images/sample.ppm", "label": 3, "prediction": 0, "attributes": {"domain": "food", "has_image": 1}}
+{"id": "b002", "query": "红烧肉热量高吗", "doc": "五花肉焯水后加冰糖炒糖色，这道菜偏肥。", "label": 2, "attributes": {"domain": "food", "has_image": 0}}
+{"id": "b003", "query": "北京今天天气", "doc": "北京市气象台预报，今天阴转小雨，北风三级。", "label": 3, "attributes": {"domain": "weather", "has_image": 0}}
+{"id": "b004", "query": "北京今天天气", "doc": "昨晚欧冠决赛在雨中进行，主队最后时刻绝杀。", "label": 0, "attributes": {"domain": "weather", "has_image": 0}}
+{"id": "b005", "query": "iPhone 16 价格", "doc": "这款手机起售价高于上一代，存储从 128GB 起。", "label": 2, "attributes": {"domain": "phone", "has_image": 0}}
+{"id": "b006", "query": "iPhone 16 价格", "doc": "苹果派要放冷藏黄油，烤箱预热到 200 度。", "label": -1, "attributes": {"domain": "phone", "has_image": 0}}
+{"id": "b007", "query": "机器学习入门看什么", "doc": "这份讲义从线性模型讲到神经网络，带有习题。", "label": 2, "attributes": {"domain": "ml", "has_image": 0}}
+{"id": "b008", "query": "机器学习入门看什么", "doc": "周末菜场西红柿降价，叶菜仍偏贵。", "label": 0, "attributes": {"domain": "ml", "has_image": 0}}
