@@ -122,9 +122,10 @@ def _grade_ids(tokenizer, cfg: Config) -> dict[str, int]:
     return resolve_grade_ids(tokenizer, cfg.grades, cfg.grade_token_ids)
 
 
-def is_tied_lm_head(model) -> bool:
+def is_tied_lm_head(model, head=None) -> bool:
     """True when lm_head shares storage with the input embedding (editing one edits both)."""
-    head = getattr(model, "lm_head", None)
+    if head is None:
+        head = getattr(model, "lm_head", None)
     getter = getattr(model, "get_input_embeddings", None)
     if head is None or not callable(getter):
         return False

@@ -32,7 +32,7 @@ from rba.data.encode import EncodedCase, ExcludedCase, collate, encode_cases, ne
 from rba.errors import RBAError
 from rba.llm.client import chat, extract_json
 from rba.llm.prompt import build_group_prompt
-from rba.models.loader import check_checkpoint_dir, load_models
+from rba.models.loader import check_checkpoint_dir, is_tied_lm_head, load_models
 from rba.models.paths import attention_module, describe_model, output_projection, resolve_paths
 from rba.repair import evaluate as _evaluate
 from rba.repair.evaluate import compare, conclusion, metric_block
@@ -45,7 +45,7 @@ from rba.util import batched, decision_index, file_fingerprint, oom_message, sta
 INVALID_GRADE = getattr(_evaluate, "INVALID_GRADE", "__invalid__")
 VERIFIED_STATUSES = {"消融有效", "已验证"}
 NOT_RECOMMENDED_STATUSES = {"被复核否定", "消融无效果", "证据不足", "先处理这个", "未执行"}
-CACHE_SCHEMA = 3
+CACHE_SCHEMA = 4
 _IDENTITY_FILES = (
     "config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "tokenizer.model",
     "vocab.json", "merges.txt", "special_tokens_map.json", "added_tokens.json", "chat_template.json",
@@ -81,6 +81,7 @@ def analyze(cfg: Config) -> dict:
     info("[1/8] 加载模型")
     loaded = load_models(cfg)
     resolved = resolve_paths(loaded.ft, cfg.module_paths, loaded.preset)
+    loaded.tied_lm_head = is_tied_lm_head(loaded.ft, resolved.lm_head(loaded.ft))
     for note in resolved.notes:
         warn(note)
     architecture = describe_model(loaded.ft, resolved)
@@ -283,6 +284,7 @@ def evaluate_patch(cfg: Config, patch: dict, run_meta: dict | None = None) -> di
     info("加载模型以验收补丁")
     loaded = load_models(cfg)
     resolved = resolve_paths(loaded.ft, cfg.module_paths, loaded.preset)
+    loaded.tied_lm_head = is_tied_lm_head(loaded.ft, resolved.lm_head(loaded.ft))
     grades = cfg.grades
     grade_ids = loaded.grade_ids
     grade_id_list = [grade_ids[grade] for grade in grades]
@@ -529,6 +531,12 @@ def _validate_and_load(cfg: Config):
     good = []
     if cfg.goodcases:
         good = load_cases(cfg.goodcases, cfg.grades, what="对照集")
+    all_ids = [case.id for case in bad + good]
+    if len(set(all_ids)) != len(all_ids):
+        raise RBAError(
+            "样本 id 重复（包括坏例和对照之间），会混淆探针标签与归因记录。",
+            "给所有样本使用全局唯一 id，例如坏例 b001、对照 g001；检查自动生成的 id。",
+        )
     missing = [case.image for case in bad + good if case.image and not Path(case.image).exists()]
     if missing:
         if cfg.missing_image == "exclude":
@@ -551,6 +559,13 @@ def _split_info(bad: list[Case], cfg: Config) -> dict:
             digest = hashlib.sha256(f"{cfg.seed}:{case.id}".encode("utf-8")).digest()
             if int.from_bytes(digest[:8], "big") / 2**64 < fraction:
                 holdout.append(case.id)
+    holdout_ids = set(holdout)
+    held_content = {_content_key(case) for case in bad if case.id in holdout_ids}
+    if any(_content_key(case) in held_content for case in bad if case.id not in holdout_ids):
+        raise RBAError(
+            "同一坏例内容以不同 id 同时落入发现集和验收集，验收集不独立。",
+            "先按 query、doc、image 去重，再运行分析和验收；不能仅靠更换 id 隔离同一输入。",
+        )
     return {
         "holdout_fraction": fraction,
         "n_total": len(bad),
@@ -1249,7 +1264,17 @@ def check_base_grade_alignment(cfg: Config, loaded, grade_ids: dict) -> dict:
             f"基座和微调的分词器对等级 token 的编码不同：{mismatched}。",
             "ΔW 的 lm_head 等级行无法逐行对应。确认 --base 是这次微调真正的起点；或在 analyses 里关掉 delta_w。",
         )
-    return {"status": "aligned", "reason": None, "checked": cfg.grade_mode}
+    # Matching five label IDs says nothing about the other vocabulary rows.
+    # A full-head SVD mixes all rows, so its token semantics require the entire
+    # token -> ID mapping (including added tokens) to match.
+    try:
+        base_vocab = base_tok.get_vocab()
+        ft_vocab = loaded.tokenizer.get_vocab()
+    except (AttributeError, TypeError, NotImplementedError):
+        return {"status": "unavailable", "reason": "等级编码相同，但无法验证完整词表 ID 对齐，关闭读出 ΔW 语义。", "checked": cfg.grade_mode}
+    if not base_vocab or base_vocab != ft_vocab:
+        return {"status": "unavailable", "reason": "等级编码相同，但基座和微调完整词表的 token→ID 映射不同，关闭读出 ΔW 语义。", "checked": cfg.grade_mode}
+    return {"status": "aligned", "reason": None, "checked": "full_vocabulary"}
 
 
 # --------------------------------------------------------------------------- hypotheses, prompts, llm

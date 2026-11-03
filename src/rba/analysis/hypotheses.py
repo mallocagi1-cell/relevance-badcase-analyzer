@@ -164,6 +164,7 @@ def propose_checks(summary: dict, mech: dict, delta: dict | None, verify_top_k: 
     import random
     rng = random.Random(int(hashlib.sha256(summary["key"].encode()).hexdigest()[:16], 16))
     components = mech.get("components") or []
+    target_keys = {c["key"] for c in components[:verify_top_k]}
     checks = []
     for component in components[:verify_top_k]:
         key = component["key"]
@@ -172,8 +173,13 @@ def propose_checks(summary: dict, mech: dict, delta: dict | None, verify_top_k: 
         if not controls:
             continue
         # Heads can be matched in the same layer; an MLP has no same-layer peer.
-        peers = [c for c in components if c["kind"] == component["kind"] and c["key"] != key
+        # Other candidate targets are not "random": a control drawn from them would
+        # carry its own effect and make the specificity comparison meaningless.
+        peers = [c for c in components if c["kind"] == component["kind"] and c["key"] not in target_keys
                  and (c["layer"] == component["layer"] if c["kind"] == "attn_head" else True)]
+        if not peers:
+            peers = [c for c in components if c["kind"] == component["kind"] and c["key"] != key
+                     and (c["layer"] == component["layer"] if c["kind"] == "attn_head" else True)]
         if peers:
             peer = rng.choice(peers)
             checks.append({"key": key + ":random", "target_key": key, "scope": "decision", "control_type": "random",
