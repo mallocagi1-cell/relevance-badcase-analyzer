@@ -100,6 +100,10 @@ def main(argv: list[str] | None = None) -> None:
     ft_p.add_argument("--grad-checkpointing", action="store_true", help="梯度检查点，省显存、慢一些")
     ft_p.add_argument("--overwrite", action="store_true", help="--out 已有内容时清空后再写")
 
+    report_p = sub.add_parser("report", help="从已有的分析目录重新生成可视化报告 report.html（不重算）")
+    report_p.add_argument("run_dir", help="rba analyze / rba demo 的输出目录")
+    report_p.add_argument("--language", choices=["zh", "en"], default=None, help="报告语言，默认沿用该次分析的 language（zh）")
+
     demo = sub.add_parser("demo", help="用内置小模型和样例数据干跑一遍")
     demo.add_argument("--arch", choices=["tiny", "qwen3_5_tiny"], default="tiny", help="tiny 是同结构的替身；qwen3_5_tiny 是真实类的随机小模型")
     demo.add_argument("--output-dir", default="runs/demo")
@@ -128,6 +132,14 @@ def main(argv: list[str] | None = None) -> None:
             path = out / "eval.json"
             path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
             info(f"验收结果：{path}")
+            from rba.report.visual import write_eval_report
+
+            info(f"可视化：{write_eval_report(result, out, cfg.language)}")
+            run_dir = Path(args.run) if getattr(args, "run", None) else out
+            if (run_dir / "report.json").exists() and (out == run_dir or out.parent == run_dir):
+                from rba.report.visual import build_visual_report
+
+                info(f"已把验收结果并入：{build_visual_report(run_dir)}")
         elif args.cmd == "export":
             from rba.repair.bake import export_patches
 
@@ -141,6 +153,10 @@ def main(argv: list[str] | None = None) -> None:
             cfg, _meta = _cfg_from_run_args(args, "finetune")
             output_hint = Path(args.out)
             finetune(cfg, _finetune_options(args))
+        elif args.cmd == "report":
+            from rba.report.visual import build_visual_report
+
+            info(f"可视化报告：{build_visual_report(Path(args.run_dir), args.language)}")
         elif args.cmd == "demo":
             output_hint = Path(args.output_dir)
             _cmd_demo(args)

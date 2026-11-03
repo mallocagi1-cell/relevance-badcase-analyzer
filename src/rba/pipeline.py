@@ -39,6 +39,7 @@ from rba.repair.evaluate import compare, conclusion, metric_block
 from rba.repair.interventions import apply_patch
 from rba.report.plots import save_plots
 from rba.report.render import METHODOLOGY, write_reports
+from rba.report.visual import build_visual_report
 from rba.schema import Case, load_cases
 from rba.util import batched, decision_index, file_fingerprint, oom_message, stable_hash, to_builtin
 
@@ -255,7 +256,8 @@ def analyze(cfg: Config) -> dict:
     }
     report = to_builtin(report)
     plot_names = save_plots(report, output / "plots")
-    md_path, html_path = write_reports(report, output, plot_names)
+    md_path, _detail_path = write_reports(report, output, plot_names)
+    html_path = build_visual_report(output, cfg.language, {"badcases": str(cfg.badcases) if cfg.badcases else None, "grades": list(cfg.grades), "language": cfg.language})
     _dump_used_config(cfg, output, loaded, split, excluded, fingerprint, identities)
     (output / "run.log").write_text("\n".join(lines()) + "\n", encoding="utf-8")
     info(f"报告已写入 {html_path}")

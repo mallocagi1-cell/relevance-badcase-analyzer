@@ -1,6 +1,53 @@
 # rba：相关性模型坏例分析
 
-你有一个微调过的 Qwen3.5-VL 相关性模型，它读「查询 + 文档（文字或图片）」，只输出一个等级（`-1 0 1 2 3`）。rba 拿它判错的样本，找出最可能是模型里哪一部分（某一层、某个注意力头、某段 MLP）把答案推错了，并当场做对比实验验证。你会得到一份中文报告：每类错误一组「可疑位置 + 证据 + 可直接运行的补丁验证命令」。
+![python](https://img.shields.io/badge/python-3.10%2B-blue) ![license](https://img.shields.io/badge/license-MIT-green) ![report](https://img.shields.io/badge/报告-离线%20HTML-orange)
+
+你有一个微调过的 Qwen3.5-VL 相关性模型，它读「查询 + 文档（文字或图片）」，只输出一个等级（`-1 0 1 2 3`）。rba 拿它判错的样本，找出最可能是模型里哪一部分（某一层、某个注意力头、某段 MLP）把答案推错了，当场做对比实验验证，并生成一份**可视化报告 `report.html`**（离线单文件，浏览器直接打开）。
+
+```mermaid
+flowchart LR
+    A["基座模型 + 微调模型"] --> C["rba analyze"]
+    B["坏例 bad.jsonl<br/>对照 good.jsonl"] --> C
+    C --> D["report.html<br/>可视化诊断报告"]
+    D --> E["rba eval<br/>补丁验收"]
+    E --> F["rba export<br/>补丁写进权重"]
+    E --> G["rba finetune<br/>针对性训练"]
+```
+
+## 报告长什么样
+
+| 总览：错误类型热力图 + 结论 | 每条坏例：概率、逐层 logit lens、token 归因 |
+| --- | --- |
+| ![总览](docs/images/report_overview.png) | ![坏例卡片](docs/images/report_card.png) |
+| **组件定位：层×头 DLA 热力图、Top-K** | **补丁：修复率 / 回退率 + 建议** |
+| ![组件定位](docs/images/report_components.png) | ![补丁](docs/images/report_patches.png) |
+
+（截图来自 `rba demo` 的随机小模型，数字没有实际意义。）每张图怎么看，见 **[docs/可视化报告.md](docs/可视化报告.md)**。
+
+## 命令速查
+
+| 命令 | 干什么 | 例子 |
+| --- | --- | --- |
+| `rba demo` | 用内置小模型走一遍全流程，不下载任何东西 | `rba demo` |
+| `rba init` | 按模型目录生成一份可改的配置 | `rba init --base 基座 --ft 微调 --badcases bad.jsonl` |
+| `rba analyze` | 分析坏例，写 `report.html`（可视化）、`report_detail.html` / `report.md`（全文） | `rba analyze --base 基座 --ft 微调 --badcases bad.jsonl --goodcases good.jsonl --dry-run` |
+| `rba report` | 从已有输出目录重新生成 `report.html`，不重算 | `rba report runs/demo` |
+| `rba eval` | 在坏例和对照集上验收一个补丁，写 `eval.json` + `report.html` | `rba eval --run runs/xxxx --patch runs/xxxx/patches/3_to_0_h1.json` |
+| `rba export` | 把验收过的补丁写进权重，存成标准 checkpoint | `rba export --run runs/xxxx --patch 补丁.json --out exported/` |
+| `rba finetune` | 只在定位到的层上做 LoRA / 全量修复训练 | `rba finetune --run runs/xxxx --out runs/xxxx/finetune --steps 200` |
+
+## badcase 怎么修
+
+```mermaid
+flowchart TD
+    A["rba analyze 出报告"] --> B{"有「消融有效」的补丁吗？"}
+    B -- 有 --> C["rba eval 验收"]
+    B -- 没有 --> G["rba finetune"]
+    C --> D{"修复率够高<br/>且回退率低？"}
+    D -- 是 --> E["rba export 写进权重上线"]
+    D -- 否 --> G
+    G --> H["看训练前后修复率 / 回退率"]
+```
 
 ## 5 分钟上手
 
@@ -32,7 +79,7 @@ rba analyze --base /path/to/基座模型 --ft /path/to/微调模型 \
 
 **4. 打开报告**
 
-命令结束时会打印路径，比如 `runs/xxxx/report.html`。用浏览器打开，从「先看这里」读起。
+命令结束时会打印路径，比如 `runs/xxxx/report.html`。用浏览器打开（离线可用），从「1. 总览」的结论读起；完整文字版证据在同目录的 `report_detail.html` / `report.md`。之后随时可以用 `rba report runs/xxxx` 重新生成。
 
 ## 怎么看报告
 
@@ -76,5 +123,6 @@ rba analyze --base /path/to/基座模型 --ft /path/to/微调模型 \
 
 其他文档：
 
+- **[docs/可视化报告.md](docs/可视化报告.md)**：report.html 每一节、每张图怎么看。
 - **[docs/修复与补丁.md](docs/修复与补丁.md)**：能不能修坏例、每种补丁的字段和用法、怎么读 `rba eval` 的结果、怎么真正上线。
 - **[docs/设计评审记录.md](docs/设计评审记录.md)**：发布前两位评审的发现、优先级、每轮改动、故意延期的事项和已知问题。

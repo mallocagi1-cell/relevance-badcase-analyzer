@@ -42,7 +42,7 @@ def write_reports(report: dict, folder: Path, plot_names: list[str]) -> tuple[Pa
     folder.mkdir(parents=True, exist_ok=True)
     markdown = render_markdown(report, plot_names)
     md_path = folder / "report.md"
-    html_path = folder / "report.html"
+    html_path = folder / "report_detail.html"
     md_path.write_text(markdown, encoding="utf-8")
     images = {}
     for name in plot_names:
