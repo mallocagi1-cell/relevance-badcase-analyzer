@@ -130,6 +130,7 @@ class Config:
     fresh: bool = False
     dry_run: bool = False
     chars_per_token: float = 1.6
+    language: str = "zh"
     max_llm_groups: int = 8
     prompt_max_components: int = 16
     verify_controls: bool = True
@@ -195,6 +196,8 @@ class Config:
         return cls.from_dict(data, config_path=str(path))
 
     def validate_static(self) -> None:
+        if self.language not in {"zh", "en"}:
+            raise RBAError(f"language={self.language} 无法识别。", "使用 zh（默认，中文结论）或 en（大模型用英文回答）。")
         if len(self.grades) < 2:
             raise RBAError("至少需要两个等级。", "默认是 -1,0,1,2,3。在 grades 里列出微调时使用的等级字符串。")
         if len(set(self.grades)) != len(self.grades):

@@ -137,6 +137,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, help="0 表示自动，显存不够会减半；带处理器视觉输入时固定为 1")
     parser.add_argument("--seed", type=int, help="内置小模型的随机种子")
     parser.add_argument("--decode-protocol", choices=["constrained", "free"], help="constrained 只在等级 token 里取 argmax；free 用全词表 argmax，等级外算非法输出")
+    parser.add_argument("--language", choices=["zh", "en"], help="分析结论语言：zh（默认）让大模型用中文回答；en 让大模型用英文回答。报告本身固定为中文")
     parser.add_argument("--allow-missing-images", action="store_true", help="图片读不到时剔除该样本并写进报告，而不是停下")
 
 
@@ -167,6 +168,7 @@ def _apply_cli(cfg: Config, args) -> Config:
         "seed": getattr(args, "seed", None),
         "decode_protocol": getattr(args, "decode_protocol", None),
         "holdout_fraction": getattr(args, "holdout", None),
+        "language": getattr(args, "language", None),
     }
     cfg = apply_overrides(cfg, {key: value for key, value in overrides.items() if value is not None})
     if getattr(args, "allow_missing_images", False):
