@@ -1,0 +1,3 @@
+id,query,doc,image,label,prediction,attr_domain,attr_has_image
+c001,红烧肉怎么做,五花肉焯水后炖四十分钟。,,3,0,food,0
+c002,北京今天天气,欧冠决赛在雨中进行。,,0,,weather,0

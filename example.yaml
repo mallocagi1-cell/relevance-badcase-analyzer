@@ -1,0 +1,58 @@
+# 内置小模型的干跑配置。真实模型把 base_model / ft_model 换成目录即可。
+base_model: tiny
+ft_model: tiny
+model_type: tiny
+
+badcases: examples/badcases.jsonl
+goodcases: examples/goodcases.jsonl
+
+grades: ["-1", "0", "1", "2", "3"]
+grade_mode: single_token        # first_token 只在训练协议明确按首 token 分类时声明
+decode_protocol: constrained    # free：全词表 argmax，等级外算非法输出
+image_token: "<|image_pad|>"
+image_placeholder: "<|vision_start|><|image_pad|><|vision_end|>"   # 真实模型里 {image} 的替换文本，由处理器展开
+image_seq_len: 4                # 只对内置小模型有意义
+missing_image: error            # exclude：剔除读不到图片的样本并写进报告
+holdout_fraction: 0.0           # 示例数据太少，不留验收集；真实数据建议 0.5
+input_mode: template
+
+device: cpu
+dtype: float32
+batch_size: 4
+max_length: 256
+output_dir: runs/example
+seed: 0
+plant_error: true
+max_detail_cases: 4
+verify_top_k: 3
+delta_w_top_k: 8
+svd_rank: 2
+token_attr_method: gradxinput
+ig_steps: 2
+chars_per_token: 1.6
+resume: true
+
+llm:
+  base_url: https://api.openai.com/v1
+  model: gpt-4.1
+  api_key_env: OPENAI_API_KEY
+  max_prompt_tokens: 6000
+  temperature: 0.2
+  enabled: true
+
+analyses:
+  logit_lens: true
+  dla: true
+  token_attr: true
+  delta_w: true
+  probes: true
+  cluster: true
+  verify: true
+  llm: true
+
+prompt_template: |
+  判断文档与查询的相关性。只输出一个等级，不要输出其它文字。
+  等级含义：-1 冲突或答非所问，0 不相关，1 弱相关，2 相关，3 高度相关。
+  查询：{query}
+  文档：{doc}
+  {image}相关性等级：

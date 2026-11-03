@@ -1,0 +1,4 @@
+{"id": "g001", "query": "上海地铁几号线到虹桥", "doc": "地铁 10 号线和 2 号线都可以到虹桥火车站。", "label": 3, "attributes": {"domain": "transit", "has_image": 0}}
+{"id": "g002", "query": "上海地铁几号线到虹桥", "doc": "上海今天多云，空气质量良。", "label": 0, "attributes": {"domain": "transit", "has_image": 0}}
+{"id": "g003", "query": "合同违约怎么赔偿", "doc": "违约金过高的，当事人可以请求法院适当减少。", "label": 2, "attributes": {"domain": "law", "has_image": 0}}
+{"id": "g004", "query": "猫应该吃什么", "doc": "狗粮的蛋白质结构并不适合猫，不能长期替代猫粮。", "label": 1, "attributes": {"domain": "pet", "has_image": 0}}
