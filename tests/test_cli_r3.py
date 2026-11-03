@@ -220,7 +220,7 @@ def test_html_matches_markdown_sections(tmp_path: Path):
     out = tmp_path / "parity"
     _analyze(out)
     md = (out / "report.md").read_text(encoding="utf-8")
-    html = (out / "report.html").read_text(encoding="utf-8")
+    html = (out / "report_detail.html").read_text(encoding="utf-8")
     md_h2 = re.findall(r"^## (.+)$", md, flags=re.M)
     html_h2 = re.findall(r"<h2>(.*?)</h2>", html)
     assert md_h2 == html_h2
