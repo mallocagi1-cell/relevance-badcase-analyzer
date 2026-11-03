@@ -36,6 +36,8 @@ class LoadedModels:
     grade_ids: dict
     base_path: str | None
     ft_path: str | None
+    tied_lm_head: bool = False
+    identity: dict | None = None
 
 
 def pick_device(name: str) -> torch.device:
@@ -106,6 +108,64 @@ def detect_directory(path: Path) -> dict:
     }
 
 
+def _grade_ids(tokenizer, cfg: Config) -> dict[str, int]:
+    import inspect
+
+    try:
+        accepts_mode = "grade_mode" in inspect.signature(resolve_grade_ids).parameters
+    except (TypeError, ValueError):
+        accepts_mode = False
+    if accepts_mode:
+        return resolve_grade_ids(tokenizer, cfg.grades, cfg.grade_token_ids, grade_mode=cfg.grade_mode)
+    if cfg.grade_mode != "single_token":
+        raise RBAError("当前 loader 不支持 grade_mode=first_token。", "升级 rba，或把 grade_mode 改回 single_token。")
+    return resolve_grade_ids(tokenizer, cfg.grades, cfg.grade_token_ids)
+
+
+def is_tied_lm_head(model) -> bool:
+    """True when lm_head shares storage with the input embedding (editing one edits both)."""
+    head = getattr(model, "lm_head", None)
+    getter = getattr(model, "get_input_embeddings", None)
+    if head is None or not callable(getter):
+        return False
+    try:
+        embed = getter()
+    except Exception:
+        return False
+    if embed is None or not hasattr(embed, "weight") or not hasattr(head, "weight"):
+        return False
+    if head.weight is embed.weight:
+        return True
+    try:
+        return head.weight.data_ptr() == embed.weight.data_ptr() and head.weight.shape == embed.weight.shape
+    except Exception:
+        return False
+
+
+def check_checkpoint_dir(path: str | Path, what: str) -> dict:
+    """Front-loaded check so a bad --base does not fail after the GPU stages."""
+    path = Path(path)
+    if not path.exists() or not path.is_dir():
+        raise RBAError(
+            f"找不到{what}目录 {path}。",
+            "指到含 config.json 和权重文件的 Hugging Face 模型目录。只看流程：rba demo。",
+        )
+    raw = _read_config_json(path)
+    weights = sorted(path.glob("*.safetensors")) + sorted(path.glob("pytorch_model*.bin"))
+    if not weights:
+        raise RBAError(
+            f"{what}目录 {path} 里没有 *.safetensors 或 pytorch_model*.bin。",
+            "补全权重文件。若只想看激活分析，在 analyses 里把 delta_w 设为 false（基座只用于 ΔW）。",
+        )
+    return {
+        "path": str(path.resolve()),
+        "architecture": (raw.get("architectures") or [None])[0],
+        "model_type": raw.get("model_type"),
+        "tie_word_embeddings": bool(raw.get("tie_word_embeddings", (raw.get("text_config") or {}).get("tie_word_embeddings", False))),
+        "n_weight_files": len(weights),
+    }
+
+
 def load_models(cfg: Config) -> LoadedModels:
     device = pick_device(cfg.device)
     dtype = pick_dtype(cfg.dtype, device)
@@ -127,9 +187,11 @@ def load_models(cfg: Config) -> LoadedModels:
             preset="qwen3_5",
             plant=meta.get("plant"),
             image_token_id=meta.get("image_token_id"),
-            grade_ids=resolve_grade_ids(tokenizer, cfg.grades, cfg.grade_token_ids),
+            grade_ids=_grade_ids(tokenizer, cfg),
             base_path="tiny",
             ft_path="tiny",
+            tied_lm_head=is_tied_lm_head(ft),
+            identity={"kind": "tiny", "seed": cfg.seed, "plant_error": cfg.plant_error},
         )
     if kind == "qwen3_5_tiny":
         base, ft, tokenizer, meta = build_qwen35_tiny_pair(cfg)
@@ -146,9 +208,11 @@ def load_models(cfg: Config) -> LoadedModels:
             preset="qwen3_5",
             plant=meta.get("plant"),
             image_token_id=meta.get("image_token_id"),
-            grade_ids=resolve_grade_ids(tokenizer, cfg.grades, cfg.grade_token_ids),
+            grade_ids=_grade_ids(tokenizer, cfg),
             base_path="qwen3_5_tiny",
             ft_path="qwen3_5_tiny",
+            tied_lm_head=is_tied_lm_head(ft),
+            identity={"kind": "qwen3_5_tiny", "seed": cfg.seed, "plant_error": cfg.plant_error},
         )
     ft_path = Path(cfg.ft_model)
     base_path = Path(cfg.base_model)
@@ -158,8 +222,11 @@ def load_models(cfg: Config) -> LoadedModels:
         f"{detected['num_hidden_layers']} 层，hidden {detected['hidden_size']}。"
     )
     tokenizer, processor = _load_tokenizer(ft_path)
-    grade_ids = resolve_grade_ids(tokenizer, cfg.grades, cfg.grade_token_ids)
-    info(f"等级 token：{grade_ids}。每个等级都是单个子词，可以当作下一个 token 来打分。")
+    grade_ids = _grade_ids(tokenizer, cfg)
+    if cfg.grade_mode == "first_token":
+        info(f"等级 token（first_token 模式，只看每个等级的首 token）：{grade_ids}。")
+    else:
+        info(f"等级 token：{grade_ids}。每个等级都是单个子词，可以当作下一个 token 来打分。")
     ft = _load_hf(ft_path, cfg.model_class or detected["architecture"], dtype)
     try:
         ft.to(device)
@@ -171,6 +238,11 @@ def load_models(cfg: Config) -> LoadedModels:
     ft.eval()
     for param in ft.parameters():
         param.requires_grad_(False)
+    tied = is_tied_lm_head(ft)
+    if tied:
+        warn("lm_head 和输入 embedding 共享权重。任何 lm_head 行编辑同时改动该 token 的输入表示，报告和 eval 会标出来。")
+    if processor is None:
+        warn("没有加载到 AutoProcessor，带图样本无法编码；纯文本样本改用分词器。")
     # Base stays on disk until delta-W. Keeping it out of the GPU is the point.
     return LoadedModels(
         ft=ft,
@@ -186,7 +258,25 @@ def load_models(cfg: Config) -> LoadedModels:
         grade_ids=grade_ids,
         base_path=str(base_path),
         ft_path=str(ft_path),
+        tied_lm_head=tied,
+        identity={
+            "kind": "hf",
+            "model_class": type(ft).__name__,
+            "architecture": detected.get("architecture"),
+            "tokenizer_class": type(tokenizer).__name__,
+            "processor_class": None if processor is None else type(processor).__name__,
+            "transformers_version": _transformers_version(),
+        },
     )
+
+
+def _transformers_version() -> str | None:
+    try:
+        import transformers
+
+        return transformers.__version__
+    except Exception:
+        return None
 
 
 def _kind(cfg: Config) -> str:
@@ -249,7 +339,7 @@ def _load_hf(path: Path, preferred: str | None, dtype: torch.dtype):
             errors.append(f"{name} 不在 transformers {transformers.__version__} 的导出里")
             continue
         try:
-            model = cls.from_pretrained(path, torch_dtype=dtype, low_cpu_mem_usage=True)
+            model = _from_pretrained(cls, path, dtype)
             info(f"已用 {name} 加载微调模型。")
             return model
         except Exception as exc:
@@ -259,7 +349,7 @@ def _load_hf(path: Path, preferred: str | None, dtype: torch.dtype):
         if auto is None:
             continue
         try:
-            model = auto.from_pretrained(path, torch_dtype=dtype, low_cpu_mem_usage=True)
+            model = _from_pretrained(auto, path, dtype)
             info(f"已用 {auto_name} 加载微调模型。")
             return model
         except Exception as exc:
@@ -270,6 +360,16 @@ def _load_hf(path: Path, preferred: str | None, dtype: torch.dtype):
         "确认目录完整，并升级 transformers。Qwen3.5-VL 在 transformers 5.22 中的类名是 "
         f"Qwen3_5ForConditionalGeneration，不是 Qwen3_5VLForConditionalGeneration。详情：{detail}",
     )
+
+
+def _from_pretrained(cls, path: Path, dtype: torch.dtype):
+    """transformers 5.x takes `dtype`; older releases only know `torch_dtype`."""
+    try:
+        return cls.from_pretrained(path, dtype=dtype)
+    except TypeError as exc:
+        if "dtype" not in str(exc):
+            raise
+        return cls.from_pretrained(path, torch_dtype=dtype, low_cpu_mem_usage=True)
 
 
 def iter_checkpoint_tensors(path: str | Path):
@@ -327,36 +427,56 @@ def _iter_bins(path: Path, index_path: Path | None):
         del blob
 
 
-def resolve_grade_ids(tokenizer, grades: list[str], explicit: dict | None) -> dict[str, int]:
-    if explicit:
-        missing = [grade for grade in grades if str(grade) not in {str(k) for k in explicit}]
-        if missing:
-            raise RBAError(
-                f"grade_token_ids 缺少 {', '.join(missing)}。",
-                "每个等级都要给一个整数 token id。",
-            )
-        return {str(grade): int(explicit[grade] if grade in explicit else explicit[str(grade)]) for grade in grades}
+def resolve_grade_ids(tokenizer, grades: list[str], explicit: dict | None,
+                      grade_mode: str = "single_token") -> dict[str, int]:
+    """Validate the training label protocol; explicit IDs are not an escape hatch.
+
+    first_token is a declared *prefix classifier*, not sequence likelihood or
+    a guarantee that greedy generation completes the label string.
+    """
+    if grade_mode not in {"single_token", "first_token"}:
+        raise RBAError(f"未知 grade_mode={grade_mode}。", "使用 single_token 或 first_token。")
+    labels = [str(g) for g in grades]
+    if not labels or len(set(labels)) != len(labels):
+        raise RBAError("等级为空或重复。", "grades 必须是不同的标签字符串。")
+    mapping = {}
+    for key, value in (explicit or {}).items():
+        key = str(key)
+        if key in mapping:
+            raise RBAError(f"grade_token_ids 规范化后重复键 {key}。", "每个等级只声明一次。")
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise RBAError(f"等级 {key} 的 token id 不是整数。", "使用词表中的整数 ID。")
+        mapping[key] = value
+    if explicit is not None and set(mapping) != set(labels):
+        raise RBAError("grade_token_ids 的键必须与 grades 完全一致。", f"需要 {labels}。")
+    try:
+        vocab_size = len(tokenizer)
+    except (TypeError, AttributeError):
+        vocab_size = getattr(tokenizer, "vocab_size", None)
     ids = {}
-    for grade in grades:
+    for grade in labels:
         encoded = _encode_grade(tokenizer, grade)
-        if len(encoded) != 1:
-            pieces = []
-            convert = getattr(tokenizer, "convert_ids_to_tokens", None)
-            if convert is not None:
-                try:
-                    pieces = [convert(int(i)) for i in encoded]
-                except Exception:
-                    pieces = [str(i) for i in encoded]
+        if not encoded or (grade_mode == "single_token" and len(encoded) != 1):
             raise RBAError(
-                f"等级 {grade!r} 被分成了 {len(encoded)} 个子词 {pieces or encoded}，不能当作一个解码 token。",
-                "在配置里写 grade_token_ids，把每个等级映射到词表中的单个 id；或改微调，让等级本身是单 token。",
+                f"等级 {grade!r} 被分成 {len(encoded)} 个 token：{encoded}。",
+                "single_token 要求训练标签本身为单 token；仅在训练协议明确使用独立首 token 分类时声明 grade_mode: first_token。",
             )
-        ids[grade] = int(encoded[0])
+        token_id = mapping.get(grade, int(encoded[0]))
+        if token_id < 0 or (vocab_size is not None and token_id >= vocab_size):
+            raise RBAError(f"等级 {grade} 的 ID {token_id} 超出词表。", f"候选编码为 {encoded}。")
+        if token_id != encoded[0]:
+            raise RBAError(f"等级 {grade} 的 ID {token_id} 与实际编码 {encoded} 不符。", "显式 ID 必须匹配训练标签首 token，不支持任意别名。")
+        decode = getattr(tokenizer, "decode", None)
+        if callable(decode):
+            try:
+                decoded = decode(encoded, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            except TypeError:
+                decoded = decode(encoded)
+            if decoded != grade:
+                raise RBAError(f"等级 {grade!r} 编码后解码为 {decoded!r}。", "检查 tokenizer 与训练标签的往返一致性。")
+        ids[grade] = int(token_id)
     if len(set(ids.values())) != len(ids):
-        raise RBAError(
-            f"两个等级落到了同一个 token id：{ids}。",
-            "检查 grades 的写法，或用 grade_token_ids 手动分开。",
-        )
+        raise RBAError(f"等级首 token 不唯一：{ids}。", "首 token 无法区分等级；需要完整序列评分，本工具暂不支持。")
     return ids
 
 

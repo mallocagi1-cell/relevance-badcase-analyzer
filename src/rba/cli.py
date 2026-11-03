@@ -5,16 +5,16 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 
 import torch
 
 from rba import __version__
-from rba.config import DEFAULT_TEMPLATE, Config, apply_overrides
-from rba.console import error, info
+from rba.config import DEFAULT_TEMPLATE, Config, apply_overrides, config_from_used
+from rba.console import error, info, lines
 from rba.errors import RBAError
 from rba.models.loader import detect_directory
-from rba.models.paths import PRESET_PATHS
 from rba.pipeline import analyze, evaluate_patch
 
 EPILOG = """
@@ -24,13 +24,17 @@ EPILOG = """
   rba analyze --base /path/base --ft /path/ft --badcases bad.jsonl --goodcases good.jsonl
   rba init --base /path/base --ft /path/ft --badcases bad.jsonl
   rba eval --run runs/example --patch runs/example/patches/某组_h1.json
+
+退出码：0 成功；2 配置或数据错误（已给出建议）；3 分析完成但大模型调用失败；1 程序内部错误（traceback 在输出目录的 error.log）。
 """.strip()
+
+BUILTIN_MODELS = {"tiny", "qwen3_5_tiny"}
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="rba",
-        description="分析微调相关性模型的坏例，定位最小修改，并在对照集上验收。",
+        description="分析微调相关性模型的坏例，定位最小修改，并在验收集和对照集上评估。",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -49,33 +53,43 @@ def main(argv: list[str] | None = None) -> None:
     analyze_p.add_argument("--dry-run", action="store_true", help="只写提示词，不调用大模型")
     analyze_p.add_argument("--fresh", action="store_true", help="忽略并覆盖该输出目录里的缓存")
     analyze_p.add_argument("--max-cases", type=int, help="只取前 N 条坏例，便于试跑")
+    analyze_p.add_argument("--holdout", type=float, help="按 id 哈希留出这一比例的坏例给 rba eval 做独立验收，例如 0.5")
 
-    eval_p = sub.add_parser("eval", help="在坏例和对照集上验收一个补丁")
+    eval_p = sub.add_parser("eval", help="在验收集（或发现集）和对照集上评估一个补丁")
     _add_common(eval_p)
     eval_p.add_argument("--patch", help="分析报告写出的补丁 JSON")
-    eval_p.add_argument("--run", help="某次分析的输出目录，用来补齐模型和数据路径")
+    eval_p.add_argument("--run", help="某次分析的输出目录。会完整恢复那次的配置（模板、等级、解码协议、模块路径等）")
 
     demo = sub.add_parser("demo", help="用内置小模型和样例数据干跑一遍")
     demo.add_argument("--arch", choices=["tiny", "qwen3_5_tiny"], default="tiny", help="tiny 是同结构的替身；qwen3_5_tiny 是真实类的随机小模型")
     demo.add_argument("--output-dir", default="runs/demo")
 
     args = parser.parse_args(argv)
+    output_hint: Path | None = None
     try:
         if args.cmd == "init":
             _cmd_init(args)
         elif args.cmd == "analyze":
             cfg = _cfg_from_analyze_args(args)
-            analyze(cfg)
+            output_hint = Path(cfg.output_dir) if cfg.output_dir else None
+            result = analyze(cfg)
+            if result.get("llm_failures"):
+                error(
+                    f"{len(result['llm_failures'])} 组的大模型调用失败。报告已写出：{result['html']}",
+                    "修好 llm.base_url / llm.model / 密钥后重跑同一条命令，分析阶段会从缓存接着用。",
+                )
+                sys.exit(3)
         elif args.cmd == "eval":
-            cfg, patch = _cfg_from_eval_args(args)
-            result = evaluate_patch(cfg, patch)
+            cfg, patch, run_meta = _cfg_from_eval_args(args)
+            output_hint = Path(cfg.output_dir) if cfg.output_dir else None
+            result = evaluate_patch(cfg, patch, run_meta)
             out = Path(cfg.output_dir or "runs/eval")
             out.mkdir(parents=True, exist_ok=True)
             path = out / "eval.json"
             path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
             info(f"验收结果：{path}")
-            info(result["conclusion"])
         elif args.cmd == "demo":
+            output_hint = Path(args.output_dir)
             _cmd_demo(args)
         else:
             parser.error(f"未知命令 {args.cmd}")
@@ -85,6 +99,31 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         error("已中断。", "已完成的阶段留在输出目录里。用同一个命令再跑会从缓存继续；想重算就加 --fresh。")
         sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - last resort: never a bare traceback for the user
+        log_path = _write_error_log(output_hint, exc)
+        error(
+            f"程序内部错误：{type(exc).__name__}: {str(exc)[:300]}",
+            f"完整 traceback 已写到 {log_path}。请带着这个文件和命令行反馈。已完成的阶段留在缓存里。",
+        )
+        sys.exit(1)
+
+
+def _write_error_log(output_hint: Path | None, exc: BaseException) -> Path:
+    folder = output_hint if output_hint is not None else Path.cwd() / "runs"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "error.log"
+    except OSError:
+        path = Path.cwd() / "rba-error.log"
+    body = "\n".join(lines()) + "\n\n" + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    try:
+        path.write_text(body, encoding="utf-8")
+    except OSError:
+        path = Path.cwd() / "rba-error.log"
+        path.write_text(body, encoding="utf-8")
+    return path
 
 
 def _add_common(parser: argparse.ArgumentParser) -> None:
@@ -95,8 +134,10 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--goodcases", help="对照集。不传则只报告坏例，看不出回退")
     parser.add_argument("--output-dir", help="报告目录。不传则按数据指纹放进 runs/")
     parser.add_argument("--device", help="auto、cpu 或 cuda")
-    parser.add_argument("--batch-size", type=int, help="0 表示自动，显存不够会减半")
+    parser.add_argument("--batch-size", type=int, help="0 表示自动，显存不够会减半；带处理器视觉输入时固定为 1")
     parser.add_argument("--seed", type=int, help="内置小模型的随机种子")
+    parser.add_argument("--decode-protocol", choices=["constrained", "free"], help="constrained 只在等级 token 里取 argmax；free 用全词表 argmax，等级外算非法输出")
+    parser.add_argument("--allow-missing-images", action="store_true", help="图片读不到时剔除该样本并写进报告，而不是停下")
 
 
 def _cfg_from_analyze_args(args) -> Config:
@@ -110,95 +151,89 @@ def _cfg_from_analyze_args(args) -> Config:
     cfg = Config.load(args.config) if args.config else Config()
     if not args.config:
         cfg.goodcases = None
+    return _apply_cli(cfg, args)
+
+
+def _apply_cli(cfg: Config, args) -> Config:
+    """Only fields the user typed override the config; everything else stays."""
     overrides = {
-        "base_model": args.base,
-        "ft_model": args.ft,
-        "badcases": args.badcases,
-        "goodcases": args.goodcases,
-        "output_dir": args.output_dir,
-        "device": args.device,
-        "batch_size": args.batch_size,
-        "seed": args.seed,
+        "base_model": getattr(args, "base", None),
+        "ft_model": getattr(args, "ft", None),
+        "badcases": getattr(args, "badcases", None),
+        "goodcases": getattr(args, "goodcases", None),
+        "output_dir": getattr(args, "output_dir", None),
+        "device": getattr(args, "device", None),
+        "batch_size": getattr(args, "batch_size", None),
+        "seed": getattr(args, "seed", None),
+        "decode_protocol": getattr(args, "decode_protocol", None),
+        "holdout_fraction": getattr(args, "holdout", None),
     }
     cfg = apply_overrides(cfg, {key: value for key, value in overrides.items() if value is not None})
-    if args.dry_run:
+    if getattr(args, "allow_missing_images", False):
+        cfg.missing_image = "exclude"
+    if getattr(args, "dry_run", False):
         cfg.dry_run = True
-    if args.fresh:
+    if getattr(args, "fresh", False):
         cfg.fresh = True
         cfg.resume = False
     if getattr(args, "max_cases", None):
         cfg.max_cases = args.max_cases
     _resolve_cli_paths(cfg, args)
+    cfg.validate_static()
     return cfg
 
 
 def _resolve_cli_paths(cfg: Config, args) -> None:
-    if args.badcases:
+    if getattr(args, "badcases", None):
         cfg.badcases = str(Path(args.badcases).resolve())
-    if args.goodcases:
+    if getattr(args, "goodcases", None):
         cfg.goodcases = str(Path(args.goodcases).resolve())
-    if args.base and args.base not in {"tiny", "qwen3_5_tiny"}:
+    if getattr(args, "base", None) and args.base not in BUILTIN_MODELS:
         cfg.base_model = str(Path(args.base).resolve())
-    if args.ft and args.ft not in {"tiny", "qwen3_5_tiny"}:
+    if getattr(args, "ft", None) and args.ft not in BUILTIN_MODELS:
         cfg.ft_model = str(Path(args.ft).resolve())
 
 
 def _cfg_from_eval_args(args):
-    if not args.patch and not args.run:
+    if not args.patch:
         raise RBAError(
             "验收需要一个补丁。",
             "用分析报告 patches/ 里的 JSON：rba eval --run runs/某次 --patch runs/某次/patches/组_h1.json",
         )
-    base_cfg = None
+    run_meta: dict = {}
     if args.run:
-        used = Path(args.run) / "config.used.json"
-        if not used.exists():
+        used_path = Path(args.run) / "config.used.json"
+        if not used_path.exists():
             raise RBAError(
                 f"{args.run} 里没有 config.used.json。",
                 "把 --run 指到某次 analyze 的输出目录，或改用 --config / --ft / --badcases。",
             )
-        base_cfg = Config.from_dict(json.loads(used.read_text(encoding="utf-8")))
+        try:
+            used = json.loads(used_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RBAError(f"{used_path} 不是合法 JSON：{exc}", "重新跑一次 rba analyze 生成它。") from exc
+        run_meta = used.get("runtime") or {}
+        cfg = config_from_used(used)
+        if args.config:
+            raise RBAError("--run 和 --config 不能同时用。", "--run 已经完整恢复那次分析的配置；要换配置就不要传 --run。")
         if args.output_dir is None:
             args.output_dir = str(Path(args.run) / "eval")
-    if args.config:
-        base_cfg = Config.load(args.config)
-    if base_cfg is None:
+    elif args.config:
+        cfg = Config.load(args.config)
+    else:
         if not (args.ft and args.badcases):
             raise RBAError(
                 "验收还缺模型和坏例。",
-                "rba eval --ft 微调目录 --badcases 坏例.jsonl --goodcases 对照.jsonl --patch 补丁.json",
+                "推荐：rba eval --run 分析目录 --patch 补丁.json。或者：rba eval --ft 微调目录 --badcases 坏例.jsonl --goodcases 对照.jsonl --patch 补丁.json",
             )
-        base_cfg = Config()
-        base_cfg.goodcases = None
-    cfg = _cfg_from_analyze_args(
-        argparse.Namespace(
-            config=None,
-            base=args.base or base_cfg.base_model,
-            ft=args.ft or base_cfg.ft_model,
-            badcases=args.badcases or base_cfg.badcases,
-            goodcases=args.goodcases if args.goodcases is not None else base_cfg.goodcases,
-            output_dir=args.output_dir,
-            device=args.device or base_cfg.device,
-            batch_size=args.batch_size,
-            seed=args.seed if args.seed is not None else base_cfg.seed,
-            dry_run=True,
-            fresh=False,
-            max_cases=None,
-        )
-    )
-    # Keep template and grades from the run that produced the patch.
-    cfg.prompt_template = base_cfg.prompt_template
-    cfg.grades = list(base_cfg.grades)
-    cfg.image_token = base_cfg.image_token
-    cfg.image_seq_len = base_cfg.image_seq_len
-    cfg.model_type = base_cfg.model_type
-    cfg.plant_error = base_cfg.plant_error
-    cfg.tiny = base_cfg.tiny
+        cfg = Config()
+        cfg.goodcases = None
+        if not args.base:
+            args.base = args.ft
+    cfg = _apply_cli(cfg, args)
     cfg.dry_run = True
-    patch_path = args.patch
-    if patch_path is None:
-        raise RBAError("没有 --patch。", "指向 patches 目录里的某一个 JSON。")
-    path = Path(patch_path)
+    cfg.fresh = False
+    path = Path(args.patch)
     if not path.exists():
         raise RBAError(f"找不到补丁 {path}。", "路径写报告里的那一行，不要手改字段名。")
     try:
@@ -207,12 +242,12 @@ def _cfg_from_eval_args(args):
         raise RBAError(f"补丁不是合法 JSON：{exc}", "重新从报告生成，或检查有没有被编辑坏。") from exc
     if not isinstance(patch, dict) or "method" not in patch:
         raise RBAError("补丁里没有 method。", "用 head_scale、mlp_zero、steering、lm_head_blend 或 ablate_tokens。")
-    return cfg, patch
+    return cfg, patch, run_meta
 
 
 def _cmd_demo(args) -> None:
     root = _examples_root()
-    cfg = Config.load(root / "example.yaml") if (root / "example.yaml").exists() else Config.load(Path("example.yaml"))
+    cfg = Config.load(root / "example.yaml")
     cfg.dry_run = True
     cfg.fresh = True
     cfg.resume = False
@@ -244,8 +279,7 @@ def _cmd_init(args) -> None:
     bad = args.badcases or "examples/badcases.jsonl"
     good = args.goodcases or "examples/goodcases.jsonl"
     detected = None
-    preset_name = "qwen3_5"
-    if ft not in {"tiny", "qwen3_5_tiny"}:
+    if ft not in BUILTIN_MODELS:
         path = Path(ft)
         if not path.exists():
             raise RBAError(
@@ -253,17 +287,14 @@ def _cmd_init(args) -> None:
                 "init 只读 config.json，不会加载权重。路径应是模型目录；试跑用 rba init --base tiny --ft tiny --badcases examples/badcases.jsonl。",
             )
         detected = detect_directory(path)
-        preset_name = detected["preset"]
         info(
             f"识别到 {detected['architecture'] or detected['model_type']}，"
             f"{detected['num_hidden_layers']} 层，hidden {detected['hidden_size']}，"
             f"图像 token id {detected['image_token_id']}。"
         )
-        if detected["architecture"] and "VL" in str(detected["architecture"]) and "Qwen3_5VL" == detected["architecture"]:
-            info("类名若加载失败，程序会改试 Qwen3_5ForConditionalGeneration。transformers 5.22 里没有 Qwen3_5VL 这个类。")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = "bfloat16" if device == "cuda" else "float32"
-    paths = PRESET_PATHS[preset_name]
+    builtin = ft in BUILTIN_MODELS
     layer_note = ""
     if detected and detected.get("layer_types"):
         kinds = detected["layer_types"]
@@ -280,26 +311,39 @@ badcases: {bad}
 goodcases: {good}
 
 grades: ["-1", "0", "1", "2", "3"]
-# 若某个等级被切成多个子词，在这里手写单个 token id，例如
-# grade_token_ids: {{"-1": 123, "0": 15, "1": 16, "2": 17, "3": 18}}
+# 等级 token 协议。single_token：每个等级本身就是一个 token。
+# 若 "-1" 被切成 "-" 和 "1"，并且训练时确实是按首 token 分类，才写 first_token（报告会标明）。
+grade_mode: single_token
+# 若要手写 token id，键用字符串，并且必须等于分词器对该等级的首 token：
+# grade_token_ids: {{"-1": 12, "0": 15, "1": 16, "2": 17, "3": 18}}
 
+# 解码协议。constrained：只在等级 token 里取 argmax；free：全词表 argmax，等级外算非法输出并单独统计。
+decode_protocol: constrained
+
+# 图片。真实模型用它自己的处理器读原图；{{image}} 在模板里会换成 image_placeholder。
 image_token: "<|image_pad|>"
-image_seq_len: 4
-input_mode: template
+image_placeholder: "<|vision_start|><|image_pad|><|vision_end|>"
+image_max_pixels: 262144   # 处理器允许的最大像素数，越小图像 token 越少、越省显存
+missing_image: error       # error 停下；exclude 剔除该样本并写进报告
+image_seq_len: 4           # 只对内置小模型有意义
+input_mode: template       # template 按 prompt_template 拼；chat 用处理器的对话模板（含纯文本样本）
 
 device: {device}
 dtype: {dtype}
-batch_size: 0
+batch_size: 0              # 0 自动；带处理器视觉输入时固定为 1
 max_length: 2048
 seed: 0
-plant_error: {"true" if ft in {"tiny", "qwen3_5_tiny"} else "false"}
+plant_error: {"true" if builtin else "false"}
 
-# 留空表示加载后按模块树自动发现。下面是根据 config.json 猜的，加载时还会再核对。
-{layer_note}module_paths:
-  layers: {paths["layers"]}
-  lm_head: {paths["lm_head"]}
-  visual: {paths["visual"]}
-  final_norm: {paths["final_norm"]}
+# 验收集。按 id 哈希留出这一比例的坏例不参与选补丁，只给 rba eval 用。0 表示不留（eval 只能做发现集复评）。
+holdout_fraction: {"0.0" if builtin else "0.5"}
+
+# 模块路径。留空（注释掉）表示加载后按模块树自动发现；只有自动发现失败时才手写。
+{layer_note}# module_paths:
+#   layers: model.language_model.layers
+#   lm_head: lm_head
+#   visual: model.visual
+#   final_norm: model.language_model.norm
 
 token_attr_method: gradxinput
 ig_steps: 4
@@ -335,11 +379,10 @@ prompt_template: |
             "换一个 --out，或先把旧文件挪走。init 不会悄悄改掉你改过的配置。",
         )
     out.write_text(text, encoding="utf-8")
-    # Make sure the file we just wrote still parses.
     Config.load(out)
     info(f"已写入 {out.resolve()}。设备选了 {device} / {dtype}。")
     info(f"试跑：rba analyze --config {out} --dry-run")
-    if ft in {"tiny", "qwen3_5_tiny"}:
+    if builtin:
         info("当前基座和微调都是内置小模型。换成真实目录后再跑同一条命令。")
 
 

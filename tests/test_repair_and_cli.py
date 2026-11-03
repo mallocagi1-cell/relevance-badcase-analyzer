@@ -27,7 +27,10 @@ def _score_pair():
     bad = compare(before, after)
     assert bad["fix_rate"] == 1.0
     assert bad["regression_rate"] == 1.0
-    assert "不要保留" in conclusion(bad, bad)
+    # Two conditional rates from different populations are never compared as a net benefit.
+    text = conclusion(bad, bad)
+    assert "不能直接比较" in text or "净收益" in text
+    assert "不要保留" not in text or "非法" in text
 
 
 def test_metrics():

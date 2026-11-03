@@ -7,8 +7,13 @@ badcases: examples/badcases.jsonl
 goodcases: examples/goodcases.jsonl
 
 grades: ["-1", "0", "1", "2", "3"]
+grade_mode: single_token        # first_token 只在训练协议明确按首 token 分类时声明
+decode_protocol: constrained    # free：全词表 argmax，等级外算非法输出
 image_token: "<|image_pad|>"
-image_seq_len: 4
+image_placeholder: "<|vision_start|><|image_pad|><|vision_end|>"   # 真实模型里 {image} 的替换文本，由处理器展开
+image_seq_len: 4                # 只对内置小模型有意义
+missing_image: error            # exclude：剔除读不到图片的样本并写进报告
+holdout_fraction: 0.0           # 示例数据太少，不留验收集；真实数据建议 0.5
 input_mode: template
 
 device: cpu

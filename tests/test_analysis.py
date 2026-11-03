@@ -107,7 +107,7 @@ def test_rank_prefers_verified_over_correlation():
         {"key": "L1.mlp", "mean_delta": 0.8, "n": 4, "n_improved": 0, "agreement": 0.0},
     ]
     ranked = rank_hypotheses(summary, mech, {"lm_head_grades": {"rows": {}}, "top": []}, verifications, n_parameters=1000)
-    assert ranked[0]["status"] == "已验证"
+    assert ranked[0]["status"] == "消融有效"
     assert ranked[0]["key"] == "L0.self_attn.h0"
     rejected = next(item for item in ranked if item["key"] == "L1.mlp")
     assert rejected["status"] == "被复核否定"

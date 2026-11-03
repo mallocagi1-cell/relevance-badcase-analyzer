@@ -1,7 +1,9 @@
-"""One markdown report and one self-contained HTML report.
+"""One Markdown report and one self-contained HTML report with the same content.
 
-Both open with the ranked hypotheses and the exact command to run next.
-Evidence and the method notes come after that.
+The Markdown is the single source: the HTML is rendered from it by a small
+converter that knows exactly the constructs used here (headings, lists,
+tables, fenced code, blockquotes, images, bold and inline code). User text and
+LLM output are escaped before any formatting is applied.
 """
 
 from __future__ import annotations
@@ -9,7 +11,31 @@ from __future__ import annotations
 import base64
 import html
 import json
+import re
 from pathlib import Path
+
+STATUS_LABELS: dict[str, str] = {
+    "消融有效": "在该组抽样上（至少 4 条），决策位置的目标干预让 logit(原预测)−logit(金标) 下降，且多数样本同向，identity 对照接近 0。只说明干预有效，不是根因证明；选择样本与复核样本是否分开会写在证据里。",
+    "已验证": "旧版本的叫法，等同于「消融有效」。",
+    "仅相关": "归因或 ΔW 指向它，但还没做干预，或者只做了诊断性干预（例如 lm_head 行混合）。",
+    "被复核否定": "干预反而让误差变大。留在列表里，不拿去当根因。",
+    "消融无效果": "干预几乎不改变错误 logit。",
+    "复核不稳定": "干预效果在样本之间方向不一致。",
+    "证据不足": "复核样本少于 4 条、identity 对照非零，或最终读出分解重建失败。这类假设不给验收命令。",
+    "先处理这个": "等级词上几乎没有概率质量，或全词表 argmax 不是等级词。先核对模板和解码协议，再看中间层。",
+    "未执行": "这项复核没有运行（例如 lm_head 与 embedding 共享权重时的行编辑）。缺失不等于通过。",
+}
+_STATUS_CLASS = {
+    "消融有效": "ok",
+    "已验证": "ok",
+    "先处理这个": "note",
+    "被复核否定": "bad",
+    "证据不足": "bad",
+    "消融无效果": "mid",
+    "复核不稳定": "mid",
+    "仅相关": "mid",
+    "未执行": "mid",
+}
 
 
 def write_reports(report: dict, folder: Path, plot_names: list[str]) -> tuple[Path, Path]:
@@ -23,18 +49,19 @@ def write_reports(report: dict, folder: Path, plot_names: list[str]) -> tuple[Pa
         file = folder / "plots" / name
         if file.exists():
             images[name] = base64.b64encode(file.read_bytes()).decode("ascii")
-    html_path.write_text(render_html(report, images), encoding="utf-8")
+    html_path.write_text(render_html(report, images, markdown=markdown), encoding="utf-8")
     (folder / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     return md_path, html_path
 
 
+# --------------------------------------------------------------------------- markdown
+
+
 def render_markdown(report: dict, plot_names: list[str]) -> str:
-    lines = [f"# 相关性坏例分析报告", "", f"输出目录：`{report['output_dir']}`", ""]
+    lines: list[str] = ["# 相关性坏例分析报告", "", f"输出目录：`{report['output_dir']}`", ""]
     if report.get("banner"):
         lines += [f"> {report['banner']}", ""]
-    lines += ["## 先看这里", ""]
-    lines.append(report["lead"])
-    lines.append("")
+    lines += ["## 先看这里", "", report["lead"], ""]
     for group in report.get("groups") or []:
         lines.append(f"### {group['key']} · {group['count']} 条")
         lines.append("")
@@ -44,21 +71,27 @@ def render_markdown(report: dict, plot_names: list[str]) -> str:
             continue
         shown = group["hypotheses"][:4]
         for item in shown:
-            lines.append(f"{item['rank']}. **[{item['status']}]** {item['title']}（置信度 {item['confidence']}）")
+            strength = item.get("evidence_strength") or item.get("status")
+            lines.append(f"{item['rank']}. **[{item['status']}]** {item['title']}（证据强度：{strength}）")
             lines.append("")
-            lines.append(item["evidence"])
+            lines.append(item.get("evidence") or "")
             lines.append("")
             if item.get("weight_fraction") is not None:
                 lines.append(f"若写成权重，大约动全部参数的 {item['weight_fraction']:.4%}。")
                 lines.append("")
+            if item.get("tied_note"):
+                lines.append(f"注意：{item['tied_note']}")
+                lines.append("")
             if item.get("command"):
-                lines.append("下一步：")
+                if item.get("exploratory"):
+                    lines.append(f"探索性验收（{item.get('exploratory_note', '')}）：")
+                else:
+                    lines.append("下一步：")
+                lines += ["", "```bash", item["command"], "```", ""]
+            if item.get("evidence_ids"):
+                lines.append("证据编号：" + "、".join(f"`{eid}`" for eid in item["evidence_ids"]))
                 lines.append("")
-                lines.append("```bash")
-                lines.append(item["command"])
-                lines.append("```")
-                lines.append("")
-            lines.append(f"会推翻它的观察：{item['would_refute']}")
+            lines.append(f"会推翻它的观察：{item.get('would_refute', '')}")
             lines.append("")
         hidden = len(group["hypotheses"]) - len(shown)
         if hidden > 0:
@@ -67,184 +100,357 @@ def render_markdown(report: dict, plot_names: list[str]) -> str:
         if group.get("clusters"):
             lines.append("簇（只按概率和长度分开，没有命名）：" + json.dumps(group["clusters"], ensure_ascii=False))
             lines.append("")
+
     lines += ["## 这次跑了什么", ""]
     overview = report["overview"]
     lines.append(f"- 坏例 {overview['n_bad']} 条，预测对 {overview['n_bad_correct']} 条，错 {overview['n_bad_wrong']} 条。")
     if overview.get("bad_accuracy") is not None:
-        lines.append(f"- 坏例文件上的准确率 {overview['bad_accuracy']:.1%}，MAE { _fmt(overview.get('bad_mae')) }。文件里本来就是错例时，准确率低是预期的。")
+        lines.append(
+            f"- 坏例文件上的准确率 {overview['bad_accuracy']:.1%}，MAE {_fmt(overview.get('bad_mae'))}，"
+            f"全词表 top 是等级词的比例 {_pct(overview.get('bad_legal_rate'))}。文件里本来就是错例时，准确率低是预期的。"
+        )
     if overview.get("good_accuracy") is not None:
         lines.append(
-            f"- 对照集 {overview['n_good']} 条，准确率 {overview['good_accuracy']:.1%}，MAE {_fmt(overview.get('good_mae'))}。"
+            f"- 对照集 {overview['n_good']} 条，准确率 {overview['good_accuracy']:.1%}，MAE {_fmt(overview.get('good_mae'))}，"
+            f"全词表 top 是等级词的比例 {_pct(overview.get('good_legal_rate'))}。"
         )
+    if overview.get("n_invalid_bad") or overview.get("n_invalid_good"):
+        lines.append(f"- 非法输出（全词表 argmax 不是等级词）：坏例 {overview.get('n_invalid_bad', 0)} 条，对照 {overview.get('n_invalid_good', 0)} 条，见下面「非法输出」。")
+    if overview.get("n_excluded"):
+        lines.append(f"- 剔除 {overview['n_excluded']} 条样本（图片读不到），见「剔除的样本」。")
+    lines.append(
+        f"- 协议：等级 token {report.get('grade_mode', 'single_token')}，解码 {report.get('decode_protocol', 'constrained')}，"
+        f"输入 {report.get('input_mode', 'template')}。"
+        + (" lm_head 与输入 embedding 共享权重：任何 lm_head 行编辑同时改输入表示。" if report.get("tied_lm_head") else "")
+    )
+    split = report.get("split") or {}
+    if split:
+        lines.append(f"- 验收集：{split.get('note', '')}" + (f" 留出 {split['n_holdout']}/{split['n_total']} 条。" if split.get("n_holdout") else ""))
     lines.append(f"- 设备 {report['device']}，dtype {report['dtype']}，类名 {report['architecture'].get('class_name')}。")
     lines.append(f"- 等级 token：`{json.dumps(report['grade_ids'], ensure_ascii=False)}`。")
     if report.get("warnings"):
-        lines.append("")
-        lines.append("注意：")
+        lines += ["", "注意：", ""]
         for item in report["warnings"]:
             lines.append(f"- {item}")
-    lines += ["", "## 图", ""]
+    lines.append("")
+
+    invalid = report.get("invalid_rows") or []
+    if invalid:
+        lines += ["## 非法输出", "", "这些坏例的全词表 argmax 不是等级词。它们没有进入按等级索引的归因；先核对模板和解码协议。", ""]
+        lines.append("| 样本 | 金标 | 全词表 top token | 等级内 argmax | 等级词概率质量 |")
+        lines.append("| --- | --- | --- | --- | ---: |")
+        for row in invalid:
+            lines.append(f"| {row['id']} | {row['label']} | {row.get('full_top_token')} | {row.get('constrained_pred')} | {_fmt(row.get('grade_mass'))} |")
+        lines.append("")
+    excluded = report.get("excluded") or []
+    if excluded:
+        lines += ["## 剔除的样本", ""]
+        for row in excluded:
+            lines.append(f"- {row['id']}：{row['reason']}")
+        lines.append("")
+
+    lines += ["## 图", ""]
     for name in plot_names:
         lines.append(f"![{name}](plots/{name})")
         lines.append("")
+
     lines += ["## 证据", ""]
     for group in report.get("groups") or []:
-        if not group.get("components"):
+        if not group.get("components") and not group.get("verifications"):
             continue
         lines.append(f"### {group['key']}")
         lines.append("")
-        lines.append("| 组件 | 归因均值 | 标准差 | 占比 |")
-        lines.append("| --- | ---: | ---: | ---: |")
-        for row in group["components"][:12]:
-            lines.append(f"| {row['key']} | {row['mean_attr']:.4f} | {row['std_attr']:.4f} | {row['share']:.1%} |")
-        lines.append("")
+        reliable = group.get("attribution_reliable")
+        if reliable is not None:
+            lines.append(
+                f"读出分解{'可靠' if reliable else '不可靠'}（重建误差 {_fmt(group.get('reconstruction_error'))}）。"
+                "归因是最终 RMSNorm 之后、按真实 norm 增益折算的读出贡献，正值支持原预测，负值支持金标。"
+            )
+            lines.append("")
+        if group.get("components"):
+            lines.append("| 组件 | 归因均值 | 标准差 | 绝对占比 |")
+            lines.append("| --- | ---: | ---: | ---: |")
+            for row in group["components"][:12]:
+                lines.append(f"| {row['key']} | {row['mean_attr']:.4f} | {row['std_attr']:.4f} | {row['share']:.1%} |")
+            lines.append("")
         token = group.get("token_attr") or {}
         if token:
+            text = token.get("text_abs_share")
+            image = token.get("image_abs_share")
             lines.append(
-                f"Token 归因（{token.get('method')}）：文本绝对占比 {token.get('text_abs_share'):.1%}，"
-                f"图像绝对占比 {token.get('image_abs_share'):.1%}。"
+                f"Token 归因（{token.get('method')}，{token.get('n')} 条）：文本绝对占比 {_pct(text)}，图像绝对占比 {_pct(image)}，"
+                f"文本带符号贡献 {_fmt(token.get('text_signed'))}，图像带符号贡献 {_fmt(token.get('image_signed'))}。"
+                + (f" 完整性误差 {_fmt(token.get('completeness_gap'))}。" if token.get("completeness_gap") is not None else "")
+                + (" 可靠性标记：不可靠。" if token.get("reliable") is False else "")
             )
             lines.append("")
         if group.get("verifications"):
-            lines.append("| 复核 | 错误 logit 变化 | 变小的条数 |")
-            lines.append("| --- | ---: | ---: |")
-            for row in group["verifications"]:
-                lines.append(f"| {row['key']} | {_fmt(row.get('mean_delta'))} | {row.get('n_improved')}/{row.get('n')} |")
+            lines.append("干预复核。target 是被检验的组件，random 是同类随机对照，identity 是什么都不改的对照（应接近 0）。「范围」是干预真正作用的位置。")
             lines.append("")
+            lines.append("| 复核 | 类型 | 范围 | 独立样本 | 错误 logit 变化 | 变小的条数 |")
+            lines.append("| --- | --- | --- | --- | ---: | ---: |")
+            for row in group["verifications"]:
+                if row.get("skipped"):
+                    lines.append(f"| {row['key']} | {row.get('control_type', '')} | {row.get('scope', '')} | — | 未执行：{row['skipped']} | — |")
+                    continue
+                lines.append(
+                    f"| {row['key']} | {row.get('control_type', 'target')} | {row.get('scope', '')} | {'是' if row.get('selection_disjoint') else '否'} | "
+                    f"{_fmt(row.get('mean_delta'))} | {row.get('n_improved')}/{row.get('n')} |"
+                )
+            lines.append("")
+            lines.append("逐例的改前/改后差值在 report.json 的 `verifications[*].per_case`。")
+            lines.append("")
+
     delta = report.get("delta_w") or {}
-    if delta:
-        lines.append("### ΔW")
-        lines.append("")
+    if delta and (delta.get("top") or delta.get("n_tensors")):
+        lines += ["### ΔW", ""]
         lines.append(
-            f"比较了 {delta.get('n_tensors')} 个张量，相对变化超过 1e-8 的参数占比 {delta.get('changed_fraction') or 0:.4%}。"
+            f"比较了 {delta.get('n_tensors')} 个张量。非零 ΔW 元素占比 {(delta.get('changed_fraction') or 0):.4%}（共享的物理参数只计一次）。"
+            + (f" {delta['tied_edit_note']}。" if delta.get("tied_edit_note") else "")
+            + " 范数大不等于根因；奇异方向的符号是任意的。"
         )
         lines.append("")
-        lines.append("| 参数 | 相对范数 | 绝对范数 |")
-        lines.append("| --- | ---: | ---: |")
+        lines.append("| 参数 | 相对范数 | 绝对范数 | 奇异方向空间 | 解释能量 |")
+        lines.append("| --- | ---: | ---: | --- | ---: |")
         for row in (delta.get("top") or [])[:12]:
-            lines.append(f"| `{row['name']}` | {row['rel']:.4g} | {row['delta_fro']:.4g} |")
+            svd = row.get("svd") or {}
+            direction = (svd.get("directions") or [{}])[0] if isinstance(svd, dict) else {}
+            lines.append(
+                f"| `{row['name']}` | {row['rel']:.4g} | {row['delta_fro']:.4g} | {direction.get('space') or svd.get('skipped') or '—'} | {_fmt(direction.get('explained_energy'))} |"
+            )
         lines.append("")
-        grades = delta.get("lm_head_grades", {}).get("rows", {})
+        grades = (delta.get("lm_head_grades") or {}).get("rows") or {}
         if grades:
             lines.append("lm_head 等级行相对基座：")
             lines.append("")
             for grade, row in grades.items():
-                lines.append(
-                    f"- {grade}: 余弦 {_fmt(row.get('cosine_to_base'))}，差范数 {_fmt(row.get('delta_norm'))}"
-                )
+                lines.append(f"- {grade}: 余弦 {_fmt(row.get('cosine_to_base'))}，差范数 {_fmt(row.get('delta_norm'))}")
             lines.append("")
+        if delta.get("n_missing"):
+            lines.append(f"{delta['n_missing']} 个参数没能和基座对齐（名字或形状不同）。")
+            lines.append("")
+
     probes = report.get("probes") or {}
-    lines.append("### 探针")
-    lines.append("")
+    lines += ["### 探针", ""]
     if probes.get("skipped"):
         lines.append(probes["skipped"])
     else:
         lines.append(probes.get("note") or "")
+        if probes.get("n") is not None:
+            lines.append(f"样本 {probes.get('n')} 条（坏例 {probes.get('n_bad', '—')}，对照 {probes.get('n_good', '—')}，交错抽取）。")
         for layer in (probes.get("layers") or [])[:6]:
             bits = []
             for attr in layer["attributes"]:
                 if attr["kind"] == "numeric":
                     bits.append(f"{attr['attribute']} 留出 R² {_fmt(attr.get('r2_heldout'))}")
                 else:
-                    bits.append(f"{attr['attribute']} 留出准确率 {_fmt(attr.get('accuracy_heldout'))}")
+                    baseline = attr.get("majority_accuracy_heldout", attr.get("majority_baseline"))
+                    extra = f"（多数类基线 {_fmt(baseline)}，训练/留出 {attr.get('n_train', '—')}/{attr.get('n_test', '—')}）" if baseline is not None else ""
+                    bits.append(f"{attr['attribute']} 留出准确率 {_fmt(attr.get('accuracy_heldout'))}{extra}")
             if bits:
                 lines.append(f"- 层 {layer['layer']}: " + "；".join(bits))
     lines.append("")
+
     lines += ["## 给前沿模型的提示词", ""]
-    if report.get("dry_run"):
-        lines.append("这次是干跑，没有调用接口。提示词在 `prompts/`。")
-    elif report.get("llm_results"):
-        lines.append("模型回复在 `prompts/`，解析出的 JSON 在下面。这些是建议，不是已验证的根因。")
-        for row in report["llm_results"]:
-            lines.append(f"### {row['group']}")
-            lines.append("")
-            lines.append("```json")
-            lines.append(json.dumps(row.get("parsed") or {"raw": row.get("raw", "")[:2000]}, ensure_ascii=False, indent=2))
-            lines.append("```")
-            lines.append("")
+    mode = report.get("llm_mode") or ("dry_run" if report.get("dry_run") else "remote")
+    if mode == "off":
+        lines.append("配置关闭了大模型阶段，没有生成提示词。")
+    elif mode == "dry_run":
+        lines.append("这次没有调用接口。提示词（含证据包）在 `prompts/`：")
+        for name in report.get("prompt_files") or []:
+            lines.append(f"- `{name}`")
     else:
-        lines.append("这次没有生成提示词。")
-    lines += ["", "## 方法说明", "", report["methodology"], ""]
+        if report.get("llm_results"):
+            lines.append("模型回复在 `prompts/`，解析出的 JSON 在下面。这些是建议，不是已验证的根因；每条解释应引用证据编号。")
+            lines.append("")
+            for row in report["llm_results"]:
+                lines += [f"### {row['group']}", "", "```json", json.dumps(row.get("parsed") or {"raw": row.get("raw", "")[:2000]}, ensure_ascii=False, indent=2), "```", ""]
+        if report.get("llm_failures"):
+            lines.append("调用失败的组（提示词仍在 `prompts/`，修好接口后重跑同一条命令即可）：")
+            lines.append("")
+            lines.append("| 组 | 错误 | 提示词 |")
+            lines.append("| --- | --- | --- |")
+            for row in report["llm_failures"]:
+                lines.append(f"| {row['group']} | {row['error']} | `{row.get('prompt_file', '')}` |")
+            lines.append("")
+        if not report.get("llm_results") and not report.get("llm_failures"):
+            lines.append("这次没有生成提示词（没有可分析的混淆组）。")
+    lines.append("")
+
+    lines += ["## 方法说明", "", report["methodology"], ""]
+    lines += ["### 状态含义", "", "| 状态 | 含义 |", "| --- | --- |"]
+    for status, meaning in STATUS_LABELS.items():
+        if status == "已验证":
+            continue
+        lines.append(f"| {status} | {meaning} |")
+    lines.append("")
     return "\n".join(lines)
 
 
-def render_html(report: dict, images: dict[str, str]) -> str:
-    body = []
-    if report.get("banner"):
-        body.append(f"<div class='banner'>{html.escape(report['banner'])}</div>")
-    body.append("<h2>先看这里</h2>")
-    body.append(f"<p class='lead'>{html.escape(report['lead'])}</p>")
-    for group in report.get("groups") or []:
-        body.append(f"<h3>{html.escape(group['key'])} · {group['count']} 条</h3>")
-        if not group.get("hypotheses"):
-            body.append("<p>这一组没有逐层证据。</p>")
-            continue
-        shown = group["hypotheses"][:4]
-        for item in shown:
-            klass = {"已验证": "ok", "先处理这个": "note", "被复核否定": "bad", "证据不足": "bad"}.get(item["status"], "mid")
-            command = ""
-            if item.get("command"):
-                command = f"<pre>{html.escape(item['command'])}</pre>"
-            fraction = ""
-            if item.get("weight_fraction") is not None:
-                fraction = f"<p>若写成权重，大约动全部参数的 {item['weight_fraction']:.4%}。</p>"
-            body.append(
-                f"<article class='card {klass}'>"
-                f"<h4><span class='tag {klass}'>{html.escape(item['status'])}</span> "
-                f"{html.escape(item['title'])} <small>置信度 {item['confidence']}</small></h4>"
-                f"<p>{html.escape(item['evidence'])}</p>"
-                f"{fraction}{command}"
-                f"<p class='refute'>会推翻它的观察：{html.escape(item['would_refute'])}</p>"
-                f"</article>"
-            )
-        hidden = len(group["hypotheses"]) - len(shown)
-        if hidden:
-            body.append(f"<p>其余 {hidden} 条在 report.json 里。</p>")
-    overview = report["overview"]
-    body.append("<h2>概览</h2><ul>")
-    body.append(f"<li>坏例 {overview['n_bad']}，错 {overview['n_bad_wrong']}，对 {overview['n_bad_correct']}。</li>")
-    if overview.get("good_accuracy") is not None:
-        body.append(f"<li>对照集准确率 {overview['good_accuracy']:.1%}。</li>")
-    body.append(f"<li>类名 {html.escape(str(report['architecture'].get('class_name')))}，设备 {html.escape(report['device'])}。</li>")
-    body.append("</ul>")
-    if images:
-        body.append("<h2>图</h2>")
-        for name, blob in images.items():
-            body.append(f"<figure><img alt='{html.escape(name)}' src='data:image/png;base64,{blob}'/><figcaption>{html.escape(name)}</figcaption></figure>")
-    body.append("<h2>方法说明</h2>")
-    for paragraph in report["methodology"].split("\n\n"):
-        body.append(f"<p>{html.escape(paragraph)}</p>")
-    body.append("<details><summary>完整 JSON 摘要在 report.json</summary><p>同目录的 report.json 含混淆表、归因和补丁字段。</p></details>")
+# --------------------------------------------------------------------------- html
+
+
+def render_html(report: dict, images: dict[str, str], markdown: str | None = None) -> str:
+    if markdown is None:
+        markdown = render_markdown(report, list(images))
+    body = _markdown_to_html(markdown, images)
     style = """
     body { font-family: "Noto Sans SC", "PingFang SC", "Source Han Sans SC", sans-serif; margin: 0; background: #f6f4ef; color: #1c1917; }
-    main { max-width: 920px; margin: 0 auto; padding: 32px 20px 80px; }
+    main { max-width: 960px; margin: 0 auto; padding: 32px 20px 80px; line-height: 1.55; }
     h1 { font-size: 28px; margin-bottom: 8px; }
-    h2 { margin-top: 36px; }
-    .banner { background: #fef3c7; border: 1px solid #f59e0b; padding: 12px 14px; border-radius: 10px; }
-    .lead { font-size: 16px; line-height: 1.6; }
-    .card { background: white; border-radius: 12px; padding: 14px 16px; margin: 12px 0; border-left: 6px solid #a8a29e; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
-    .card.ok { border-left-color: #15803d; }
-    .card.mid { border-left-color: #b45309; }
-    .card.bad { border-left-color: #b91c1c; }
-    .card.note { border-left-color: #1d4ed8; }
-    .tag { font-size: 12px; padding: 2px 6px; border-radius: 999px; background: #e7e5e4; }
-    .tag.ok { background: #dcfce7; }
-    .tag.mid { background: #ffedd5; }
-    .tag.bad { background: #fee2e2; }
-    .tag.note { background: #dbeafe; }
+    h2 { margin-top: 36px; border-bottom: 1px solid #d6d3d1; padding-bottom: 4px; }
+    h3 { margin-top: 28px; }
+    blockquote { background: #fef3c7; border: 1px solid #f59e0b; padding: 12px 14px; border-radius: 10px; margin: 12px 0; }
+    .tag { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #e7e5e4; margin-right: 4px; white-space: nowrap; }
+    .tag.ok { background: #dcfce7; color: #14532d; }
+    .tag.mid { background: #ffedd5; color: #7c2d12; }
+    .tag.bad { background: #fee2e2; color: #7f1d1d; }
+    .tag.note { background: #dbeafe; color: #1e3a8a; }
     pre { background: #1c1917; color: #fafaf9; padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
-    .refute { color: #44403c; font-size: 14px; }
-    img { max-width: 100%; background: white; border-radius: 8px; }
-    figcaption { color: #78716c; font-size: 12px; }
+    code { background: #e7e5e4; padding: 1px 4px; border-radius: 4px; font-size: 90%; }
+    pre code { background: none; padding: 0; }
+    table { border-collapse: collapse; margin: 10px 0 16px; font-size: 14px; max-width: 100%; display: block; overflow-x: auto; }
+    th, td { border: 1px solid #d6d3d1; padding: 5px 8px; text-align: left; vertical-align: top; }
+    th { background: #e7e5e4; }
+    img { max-width: 100%; background: white; border-radius: 8px; display: block; margin: 8px 0; }
+    ol > li { margin: 10px 0; }
     """
     return (
         "<!DOCTYPE html><html lang='zh'><head><meta charset='utf-8'/>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
         f"<title>坏例分析报告</title><style>{style}</style></head><body><main>"
-        "<h1>相关性坏例分析报告</h1>"
-        + "\n".join(body)
+        + body
         + "</main></body></html>"
     )
+
+
+_TAG_RE = re.compile(r"\*\*\[([^\]]+)\]\*\*")
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_CODE_RE = re.compile(r"`([^`]+)`")
+_IMG_RE = re.compile(r"^!\[([^\]]*)\]\(([^)]+)\)$")
+_OL_RE = re.compile(r"^(\d+)\. (.*)$")
+
+
+def _inline(text: str) -> str:
+    escaped = html.escape(text, quote=False)
+
+    def tag(match):
+        status = html.unescape(match.group(1))
+        klass = _STATUS_CLASS.get(status, "mid")
+        return f"<span class='tag {klass}'>{match.group(1)}</span>"
+
+    escaped = _TAG_RE.sub(tag, escaped)
+    escaped = _BOLD_RE.sub(r"<strong>\1</strong>", escaped)
+    escaped = _CODE_RE.sub(r"<code>\1</code>", escaped)
+    return escaped
+
+
+def _markdown_to_html(markdown: str, images: dict[str, str]) -> str:
+    out: list[str] = []
+    lines = markdown.splitlines()
+    i = 0
+    list_kind: str | None = None
+
+    def close_list():
+        nonlocal list_kind
+        if list_kind:
+            out.append(f"</{list_kind}>")
+            list_kind = None
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped:
+            close_list()
+            i += 1
+            continue
+        if stripped.startswith("```"):
+            close_list()
+            i += 1
+            code: list[str] = []
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code.append(lines[i])
+                i += 1
+            i += 1
+            out.append("<pre><code>" + html.escape("\n".join(code), quote=False) + "</code></pre>")
+            continue
+        heading = re.match(r"^(#{1,4}) (.*)$", stripped)
+        if heading:
+            close_list()
+            level = len(heading.group(1))
+            out.append(f"<h{level}>{_inline(heading.group(2))}</h{level}>")
+            i += 1
+            continue
+        if stripped.startswith("> "):
+            close_list()
+            out.append(f"<blockquote>{_inline(stripped[2:])}</blockquote>")
+            i += 1
+            continue
+        if stripped.startswith("|"):
+            close_list()
+            rows: list[str] = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                rows.append(lines[i].strip())
+                i += 1
+            out.append(_table(rows))
+            continue
+        image = _IMG_RE.match(stripped)
+        if image:
+            close_list()
+            name = Path(image.group(2)).name
+            blob = images.get(name)
+            src = f"data:image/png;base64,{blob}" if blob else html.escape(image.group(2))
+            out.append(f"<figure><img alt='{html.escape(image.group(1))}' src='{src}'/><figcaption>{html.escape(image.group(1))}</figcaption></figure>")
+            i += 1
+            continue
+        if stripped.startswith("- "):
+            if list_kind != "ul":
+                close_list()
+                out.append("<ul>")
+                list_kind = "ul"
+            out.append(f"<li>{_inline(stripped[2:])}</li>")
+            i += 1
+            continue
+        ordered = _OL_RE.match(stripped)
+        if ordered:
+            if list_kind != "ol":
+                close_list()
+                out.append("<ol>")
+                list_kind = "ol"
+            out.append(f"<li value='{ordered.group(1)}'>{_inline(ordered.group(2))}</li>")
+            i += 1
+            continue
+        close_list()
+        paragraph = [stripped]
+        i += 1
+        while i < len(lines) and lines[i].strip() and not _is_block_start(lines[i].strip()):
+            paragraph.append(lines[i].strip())
+            i += 1
+        out.append(f"<p>{_inline(' '.join(paragraph))}</p>")
+    close_list()
+    return "\n".join(out)
+
+
+def _is_block_start(stripped: str) -> bool:
+    return (
+        stripped.startswith(("#", "> ", "- ", "|", "```", "!["))
+        or bool(_OL_RE.match(stripped))
+    )
+
+
+def _table(rows: list[str]) -> str:
+    def cells(row: str) -> list[str]:
+        return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+    if len(rows) < 2:
+        return f"<p>{_inline(rows[0])}</p>"
+    header = cells(rows[0])
+    body_rows = rows[2:] if re.match(r"^\|?\s*:?-{3,}", rows[1]) else rows[1:]
+    out = ["<table><thead><tr>" + "".join(f"<th>{_inline(cell)}</th>" for cell in header) + "</tr></thead><tbody>"]
+    for row in body_rows:
+        out.append("<tr>" + "".join(f"<td>{_inline(cell)}</td>" for cell in cells(row)) + "</tr>")
+    out.append("</tbody></table>")
+    return "\n".join(out)
 
 
 def _fmt(value) -> str:
@@ -255,20 +461,33 @@ def _fmt(value) -> str:
     return str(value)
 
 
+def _pct(value) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.1%}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 METHODOLOGY = """\
-决策位置是最后一个非填充 token。等级是它的下一个 token。预测取五个等级 logit 的 argmax，同时单独报告全词表 argmax 是否落在等级词上。若等级词质量很低，先检查模板是不是和训练时一字不差，而不是先改中间层。
+决策位置是最后一个非填充 token，等级是它的下一个 token。解码协议有两种：constrained 只在等级 token 里取 argmax；free 用全词表 argmax，落在等级外的样本记为非法输出，单独统计，不进入按等级索引的归因。两种协议都会报告全词表 top 是等级词的比例和等级词概率质量。若质量很低，先检查模板和等级 token 协议是否和训练一字不差，而不是先改中间层。
 
-Logit lens 把每一层的残差送进模型自己的最终 RMSNorm，再读五个等级行。最后一层的 lens 应当和模型真实的等级分布一致，这是接线检查。
+真实模型的输入全部走它自己的处理器：图片按原分辨率交给处理器，处理器决定图像 token 的数量；有图和无图样本用同一套模板或同一套对话模板。读不到的图片不会悄悄退化成纯文本，而是停下或剔除并写进报告。
 
-直接 logit 归因的方向是 d = W_U[预测] - W_U[金标]。某个残差写入 c 的贡献是 c·d，正号表示把决策推向错误等级。嵌入（语言层入口，视觉特征已经写入之后）加上每层注意力写入和 MLP 写入，应当等于进入最终 RMSNorm 的向量，点积也应当相加。这个和不等于 norm 之后的 logit 差，因为 RMSNorm 不是线性的。两边的数都会写在结果里。头的贡献来自注意力输出投影的分片：全注意力是 o_proj，线性注意力（GatedDeltaNet）是 out_proj。没有 bias 时，头的和等于该模块的写入。
+Logit lens 把每一层的残差送进模型自己的最终 RMSNorm，再读等级行，同时保留等级 logit 和条件概率。最后一层的 lens 应当和模型真实的等级分布一致，这是接线检查。
 
-ΔW 只说明微调动过哪里。奇异向量只有在输出维就是残差维（o_proj、out_proj、down_proj）时才投影到等级词。范数大不等于是根因。final norm 这类全局旋钮会标出来，不拿来当机制。
+读出归因的方向是 d = W_U[原预测] − W_U[金标]。报告里的组件归因是在最终 RMSNorm 之后、按真实 norm 增益和最终残差尺度折算的贡献：嵌入入口（视觉特征写入之后）加上每层注意力写入和 MLP 写入，应当重建真实的 logit 差；重建误差和「可靠」标记一起写出。旧的 norm 前点积只作为诊断保留。头的贡献来自注意力输出投影的分片：全注意力是 o_proj，线性注意力（GatedDeltaNet）是 out_proj。正值支持原预测，负值支持金标。这是归因，不是总因果效应。
 
-已验证的意思很窄：在该组抽样上，指定干预让 logit(预测)-logit(金标) 下降，并且多数样本同向。这不是对照集，也不是因果的充分条件。保留补丁之前要跑 rba eval，看坏例修复率是否高于对照回退率。消融让误差变大的组件会标成被复核否定，不会从列表里拿掉。
+干预复核在决策位置做：把某个头的输出切片乘系数、把某层 MLP 在该位置清零、或在该位置加 steering 向量。每个目标都带同类随机对照和 identity 对照（什么都不改，应接近 0）。「消融有效」的意思很窄：在该组抽样上，目标干预让 logit(原预测)−logit(金标) 下降且多数样本同向。若选择样本和复核样本没有分开、identity 非零或随机对照同样有效，状态是「证据不足」。lm_head 行混合是诊断性操作：它代数上必然缩小两行差距，不构成独立证据；lm_head 与输入 embedding 共享权重时，行编辑同时改输入表示，不会被推荐。
 
-Token 归因是语言层入口表征上的 grad×input 或积分梯度，目标同样是错误 logit。图像和文本按 token id 切开。这不是像素梯度。注意力份额只在模块真的返回了权重时计算；线性注意力层没有注意力矩阵。
+ΔW 只说明微调动过哪里。奇异向量成对保留（左、右、奇异值、解释能量），符号任意；只有输出维就是残差维的矩阵才投到等级词上，而且没有样本激活系数时，不能说某个方向「促进」了某个等级。范数大不是根因。
 
-探针是用户属性上的岭回归。留出一半仅在样本够的时候做。它不进入根因排序。
+Token 归因是语言层入口表征上的 grad×input 或积分梯度，目标同样是错误 logit，按图像 token id 和文本切开；积分梯度写出零基线、端点分数和完整性误差，不收敛时标为不可靠。这不是像素梯度，也不是图像 token 的数量占比。
 
-前沿模型拿到的是上面这些压缩数字，不是权重本身。它的 JSON 建议和测量得到的排序分开写。提示词的结构跟权重空间编程那组实验一致：先说清任务和验收，再给证据，要求最小修改，并写明什么观察会推翻它。
+探针是用户属性上的岭回归（分类带截距），交错抽取坏例和对照，报告留出一半的结果和多数类基线。它不进入根因排序。
+
+rba eval 报告两个条件率：坏例修复率和对照回退率，各带 95% Wilson 区间，再加净正确数变化。两个条件率来自不同人群，不能直接相减当作线上净收益；净收益取决于线上错误占比。只有设了 holdout_fraction 时，坏例侧才是没有参与选补丁的验收集；否则写成「发现集复评」，不代表泛化。
+
+前沿模型拿到的是带证据编号的结构化证据包：观察、解释和待验证预测分开写，对照与反证优先保留。它的回复是建议，不是已验证的根因。
 """

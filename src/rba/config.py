@@ -97,7 +97,13 @@ class Config:
     image_token: str = "<|image_pad|>"
     image_token_id: int | None = None
     image_seq_len: int = 4
+    image_placeholder: str = "<|vision_start|><|image_pad|><|vision_end|>"
+    image_max_pixels: int | None = 262144
+    missing_image: str = "error"
     input_mode: str = "template"
+    grade_mode: str = "single_token"
+    decode_protocol: str = "constrained"
+    holdout_fraction: float = 0.0
     device: str = "auto"
     dtype: str = "auto"
     batch_size: int = 0
@@ -125,6 +131,8 @@ class Config:
     dry_run: bool = False
     chars_per_token: float = 1.6
     max_llm_groups: int = 8
+    prompt_max_components: int = 16
+    verify_controls: bool = True
     force_eager_attn: bool = False
     config_path: str | None = None
 
@@ -143,6 +151,22 @@ class Config:
                 "例如 module_paths: {layers: model.language_model.layers, lm_head: lm_head}。留空则自动发现。",
             )
         cfg = cls(**data)
+        if cfg.grade_token_ids is not None:
+            if not isinstance(cfg.grade_token_ids, dict):
+                raise RBAError(
+                    "grade_token_ids 必须是「等级: token id」的映射。",
+                    '例如 grade_token_ids: {"-1": 12, "0": 15, "1": 16, "2": 17, "3": 18}。',
+                )
+            normalized: dict[str, int] = {}
+            for key, value in cfg.grade_token_ids.items():
+                text = str(key)
+                if text in normalized:
+                    raise RBAError(
+                        f"grade_token_ids 里 {key!r} 和 {text!r} 规范化后重复。",
+                        "YAML 里把键写成字符串，例如 \"-1\": 12，每个等级只出现一次。",
+                    )
+                normalized[text] = value
+            cfg.grade_token_ids = normalized
         cfg.llm = llm
         cfg.analyses = analyses
         cfg.tiny = tiny
@@ -203,6 +227,27 @@ class Config:
                 f"model_type={self.model_type} 无法识别。",
                 "可选 auto、tiny、qwen3_5_tiny、hf。",
             )
+        if self.missing_image not in {"error", "exclude"}:
+            raise RBAError(
+                f"missing_image={self.missing_image} 无法识别。",
+                "error：有图片读不到就停下；exclude：剔除这条样本并写进报告。不会悄悄退化成纯文本。",
+            )
+        if self.grade_mode not in {"single_token", "first_token"}:
+            raise RBAError(
+                f"grade_mode={self.grade_mode} 无法识别。",
+                "single_token：每个等级就是一个 token；first_token：只在训练协议明确用首 token 分类时声明。",
+            )
+        if self.decode_protocol not in {"constrained", "free"}:
+            raise RBAError(
+                f"decode_protocol={self.decode_protocol} 无法识别。",
+                "constrained：只在等级 token 里取 argmax；free：全词表 argmax，落在等级外算非法输出。",
+            )
+        if not (0.0 <= float(self.holdout_fraction) < 1.0):
+            raise RBAError("holdout_fraction 必须在 [0, 1) 之间。", "0 表示不留验收集；0.5 表示按 id 哈希留一半给 rba eval。")
+        if self.image_max_pixels is not None and int(self.image_max_pixels) < 1024:
+            raise RBAError("image_max_pixels 太小。", "至少 1024；留空表示用处理器默认值。")
+        if "{image}" in self.prompt_template and not self.image_placeholder:
+            raise RBAError("image_placeholder 不能为空。", "真实模型用处理器展开它，默认 <|vision_start|><|image_pad|><|vision_end|>。")
 
     def max_prompt_tokens_value(self) -> int:
         return int(self.llm.max_prompt_tokens)
@@ -239,7 +284,13 @@ class Config:
             "image_token": self.image_token,
             "image_token_id": self.image_token_id,
             "image_seq_len": self.image_seq_len,
+            "image_placeholder": self.image_placeholder,
+            "image_max_pixels": self.image_max_pixels,
+            "missing_image": self.missing_image,
             "input_mode": self.input_mode,
+            "grade_mode": self.grade_mode,
+            "decode_protocol": self.decode_protocol,
+            "holdout_fraction": self.holdout_fraction,
             "dtype": self.dtype,
             "max_length": self.max_length,
             "seed": self.seed,
@@ -258,7 +309,41 @@ class Config:
             "analyses": self.analyses.__dict__,
             "tiny": self.tiny.__dict__,
             "force_eager_attn": self.force_eager_attn,
+            "verify_controls": self.verify_controls,
+            "max_llm_groups": self.max_llm_groups,
+            "svd_max_dim": self.svd_max_dim,
+            "prompt_max_components": self.prompt_max_components,
         }
+
+
+CONFIG_SCHEMA_VERSION = 2
+
+
+def config_to_dict(cfg: Config) -> dict:
+    """Every field, so a run can be replayed exactly by `rba eval --run`."""
+    from dataclasses import asdict
+
+    payload = asdict(cfg)
+    payload.pop("config_path", None)
+    payload["schema_version"] = CONFIG_SCHEMA_VERSION
+    return payload
+
+
+def config_from_used(payload: dict) -> Config:
+    """Inverse of config_to_dict. Unknown or future schema versions fail loudly."""
+    data = dict(payload)
+    version = data.pop("schema_version", 1)
+    if version != CONFIG_SCHEMA_VERSION:
+        raise RBAError(
+            f"config.used.json 的 schema_version={version}，当前程序是 {CONFIG_SCHEMA_VERSION}。",
+            "用当前版本重新跑一次 rba analyze，再做 eval；旧目录的补丁不保证可比。",
+        )
+    data.pop("runtime", None)
+    allowed = {f.name for f in fields(Config)} - {"config_path"}
+    unknown = sorted(set(data) - allowed)
+    for key in unknown:
+        data.pop(key)
+    return Config.from_dict(data)
 
 
 def apply_overrides(cfg: Config, overrides: dict[str, Any]) -> Config:

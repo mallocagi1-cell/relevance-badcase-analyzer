@@ -1,176 +1,171 @@
-"""Prompts in the style of the weight-space programming logs.
-
-The blog's prompts are blunt and operational: name the architecture, say how
-the edit will be scored, forbid training and global rescaling, give compact
-numbers, and demand a minimal edit plus the observation that would refute it.
-This module does the same job for one confusion group, in Chinese, inside a
-token budget.
-"""
-
+"""Auditable evidence packets, separated observations and proposed interpretations."""
 from __future__ import annotations
 
 import json
+from collections import Counter
+from rba.errors import RBAError
 
 
 def estimate_tokens(text: str, chars_per_token: float) -> int:
-    return max(1, int(len(text) / max(chars_per_token, 0.5)))
+    return max(1, int(len(text) / max(chars_per_token, .5)))
 
 
 def fit_budget(parts: list[dict], budget_tokens: int, chars_per_token: float) -> tuple[str, list[str]]:
-    """Keep non-droppable parts, then droppable parts in order, then truncate."""
-    kept = []
-    dropped = []
-    used = 0
-    for part in parts:
-        cost = estimate_tokens(part["text"], chars_per_token)
-        if not part.get("droppable", False):
-            kept.append(part)
-            used += cost
-            continue
-        if used + cost <= budget_tokens:
-            kept.append(part)
-            used += cost
-        else:
-            room = budget_tokens - used
-            if room > 80:
-                chars = int(room * chars_per_token)
-                kept.append({**part, "text": part["text"][:chars] + "\n…（这一段因预算被截断）"})
-                used = budget_tokens
-            dropped.append(part["name"])
-    # If the required header alone is over budget, hard-truncate the whole text.
-    text = "\n\n".join(part["text"].strip() for part in kept if part["text"].strip())
+    # Reserve ALL required material first, including the trailing output schema.
+    required = [p for p in parts if not p.get("droppable", False)]
+    text = "\n\n".join(p["text"].strip() for p in required)
     if estimate_tokens(text, chars_per_token) > budget_tokens:
-        chars = int(budget_tokens * chars_per_token)
-        text = text[:chars] + "\n…（整份提示词超过预算，已从末尾截断）"
-        dropped.append("tail")
-    return text, dropped
+        raise RBAError("提示词必要约束超过预算。", "增大 llm.max_prompt_tokens；不会截断输出协议。")
+    kept = {i for i,p in enumerate(parts) if not p.get("droppable", False)}
+    dropped = []
+    for i, part in enumerate(parts):
+        if i in kept:
+            continue
+        available = {name for j,p in enumerate(parts) if j in kept for name in [p["name"], *p.get("provides", [])]}
+        if not set(part.get("requires", [])).issubset(available):
+            dropped.append(part["name"])
+            continue
+        candidate = "\n\n".join(p["text"].strip() for j,p in enumerate(parts) if j in kept or j == i)
+        if estimate_tokens(candidate, chars_per_token) <= budget_tokens:
+            kept.add(i)
+        else:
+            dropped.append(part["name"])
+    return "\n\n".join(p["text"].strip() for i,p in enumerate(parts) if i in kept), dropped
 
 
-def build_group_prompt(
-    *,
-    architecture: dict,
-    grades: list[str],
-    grade_ids: dict[str, int],
-    group: dict,
-    mech: dict,
-    hypotheses: list[dict],
-    delta_top: list[dict],
-    template: str,
-    budget_tokens: int,
-    chars_per_token: float,
-) -> dict:
-    layer_lines = []
-    for layer in architecture.get("layers", []):
-        layer_lines.append(
-            f"  层 {layer['index']}: {layer['kind']} / {layer.get('attn_name')}，"
-            f"头 {layer.get('heads')}，head_dim {layer.get('head_dim')}"
-        )
-    header = f"""任务。下面不是原始权重，而是从一个微调后的相关性模型上压出来的证据。给定查询和文档（可以有图），模型只解码一个 token，这个 token 必须是等级之一：{', '.join(grades)}。你要解释混淆组 {group['key']} 为什么会错，指出负责的组件，并给出一个最小、可复核的修改。
-
-怎么算做成。修改只会用四种动作来验收：把某个注意力头的输出乘一个系数（head_scale）、把某一层 MLP 的输出清零（mlp_zero，只用于定位）、在残差上加一个 steering 向量、或把 lm_head 里错误等级的那一行向金标等级的行混合。验收看两件事：坏例上原来判错、改完判对的比例（修复率），以及对照集上原来判对、改完判错的比例（回退率）。修复率应当高于回退率。你看不到验收集的再训练，也不许建议再训练。
-
-什么算数。要具体到层、头、MLP 或 lm_head 的某一行，并说明证据。只改错误原因，不要动整个张量的尺度，不要动 final RMSNorm 来把分布调尖。直接 logit 归因是残差写到 (W_U[预测]-W_U[金标]) 上的点积，发生在最终 RMSNorm 之前，所以它不等于 norm 之后的 logit 差。只有消融让错误 logit 下降，才写成已验证；否则就说证据不够。抽样复核不是对照集。
-
-架构。类名 {architecture.get('class_name')}，{architecture.get('n_layers')} 层，hidden {architecture.get('hidden_size')}，词表 {architecture.get('vocab_size')}，参数量 {architecture.get('n_parameters')}。
-等级 token id：{json.dumps(grade_ids, ensure_ascii=False)}。
-层：
-{chr(10).join(layer_lines)}
-路径：{json.dumps(architecture.get('paths'), ensure_ascii=False)}
-训练模板（下一个 token 才是等级，模板里不含答案）：
-{template.strip()}
-"""
-    measured = _measured_block(group, mech, hypotheses)
-    delta = _delta_block(delta_top, group)
-    examples = _examples_block(group)
-    lens = _lens_block(mech)
-    ask = """请这样回答。先用四五句中文说明：这组错在哪、你相信哪个组件、什么观察会推翻它。然后给一个 JSON 对象，不要别的字段：
-{
-  "group": "金标->预测",
-  "mechanism": "这个组件在决策位置做了什么",
-  "components": [{"kind": "attn_head|mlp|lm_head|image", "layer": 0, "head": 0, "why": "..."}],
-  "minimal_fix": {"method": "head_scale|mlp_zero|steering|lm_head_blend", "layer": 0, "heads": [0], "scale": 0.5, "grade": "0", "toward": "3", "alpha": 0.5, "from_grade": "0", "to_grade": "3", "layers": [0]},
-  "weight_note": "大约动多少参数，推理期干预就写 0",
-  "verification": "rba eval 应看到修复率高于回退率；以及会推翻你的那条观察",
-  "confidence": 0.0,
-  "insufficient_evidence": false
-}
-method 用不到的字段省略。证据不够就把 insufficient_evidence 设为 true，minimal_fix 设为 null。不要打印大段词表，不要建议梯度训练。
-"""
-    parts = [
-        {"name": "header", "text": header, "droppable": False},
-        {"name": "measured", "text": measured, "droppable": False},
-        {"name": "delta", "text": delta, "droppable": True},
-        {"name": "lens", "text": lens, "droppable": True},
-        {"name": "examples", "text": examples, "droppable": True},
-        {"name": "ask", "text": ask, "droppable": False},
-    ]
-    text, dropped = fit_budget(parts, budget_tokens, chars_per_token)
-    return {"group": group["key"], "text": text, "dropped": dropped, "estimated_tokens": estimate_tokens(text, chars_per_token)}
-
-
-def _measured_block(group: dict, mech: dict, hypotheses: list[dict]) -> str:
-    lines = [
-        f"这组证据。{group['key']} 共 {group['count']} 条，其中 {group['n_detail']} 条做了逐层分析。",
-        f"整组条件概率均值：{json.dumps(group.get('mean_probs'), ensure_ascii=False)}。",
-        f"带图比例 {group.get('has_image_fraction')}。等级词概率质量 {mech.get('grade_mass')}。全词表 argmax 落在等级词上的比例 {mech.get('full_top_grade_rate')}。",
-        f"错误 logit（预测减金标）均值 {mech.get('logit_diff_mean')}。残差分解相对差距 {mech.get('decomposition_gap')}。",
-        f"logit lens 中预测概率第一次超过金标的层：{mech.get('flip_layer')}。",
-        f"图像 token 占比 {mech.get('image_token_fraction')}，注意力打到图像上的比例 {mech.get('attn_image_share')}（用到的注意力层数 {mech.get('attn_layers_used')}）。",
-        "程序自己排的假设（已验证表示抽样消融让错误 logit 下降；不是对照集结果）：",
-    ]
-    if not hypotheses:
-        lines.append("  （没有排出假设）")
-    for item in hypotheses[:5]:
-        lines.append(
-            f"  {item['rank']}. [{item['status']}] {item['title']} 置信度 {item['confidence']} 分数 {item['score']:.2f}"
-        )
-        lines.append(f"     {item['evidence']}")
-    lines.append("归因最高的组件：")
-    for component in (mech.get("components") or [])[:8]:
-        lines.append(
-            f"  {component['key']} 均值 {component['mean_attr']:.4f} 标准差 {component['std_attr']:.4f} 占比 {component['share']:.2f}"
-        )
-    return "\n".join(lines)
-
-
-def _delta_block(delta_top: list[dict], group: dict) -> str:
-    if not delta_top:
-        return "权重差。这次没有基座对照，或 ΔW 被关掉了。"
-    lines = ["权重差。下面是相对范数最大的矩阵，不是因果排序。"]
-    for row in delta_top[:8]:
-        svd = row.get("svd") or {}
-        directions = (svd.get("directions") or [])[:1]
-        extra = ""
-        if directions:
-            extra = f" 最大奇异值 {directions[0].get('singular_value')} 空间 {directions[0].get('space')} 等级投影 {directions[0].get('grades')}"
-        lines.append(
-            f"  {row['name']} 相对范数 {row['rel']:.4g} 绝对范数 {row['delta_fro']:.4g} 形状 {row['shape']}{extra}"
-        )
-    return "\n".join(lines) + f"\n本组金标 {group['label']}，预测 {group['pred']}。"
-
-
-def _lens_block(mech: dict) -> str:
-    rows = mech.get("lens") or []
-    if not rows:
-        return ""
-    # Keep endpoints and the flip, drop the middle if the model is deep.
-    if len(rows) > 12:
-        flip = mech.get("flip_layer")
-        keep = []
-        for row in rows:
-            if row["layer"] < 2 or row["layer"] >= rows[-1]["layer"] - 1 or row["layer"] == flip:
-                keep.append(row)
-        rows = keep
-    lines = ["logit lens（最终 RMSNorm 之后，五个等级上的条件概率）："]
+def _compact_delta(rows, alignment_known=True):
+    result = []
     for row in rows:
-        lines.append(f"  层 {row['layer']}: P(预测)={row['p_pred']:.3f} P(金标)={row['p_gold']:.3f}")
-    return "\n".join(lines)
+        item = {k:v for k,v in row.items() if k != "svd"}
+        svd = row.get("svd") or {}
+        item["svd"] = {k:v for k,v in svd.items() if k != "directions"}
+        item["svd"]["directions"] = [{k:v for k,v in d.items() if k not in {"left_vector", "right_vector"}}
+                                      for d in svd.get("directions", [])]
+        if not alignment_known:
+            for direction in item["svd"]["directions"]:
+                if direction.get("space") == "vocab":
+                    direction.pop("grades", None)
+                    direction.pop("top_tokens", None)
+                    direction["semantic_projection_unavailable"] = "基座词表对齐未确认"
+        result.append(item)
+    return result
 
 
-def _examples_block(group: dict) -> str:
-    lines = ["样例（截断）："]
-    for example in group.get("examples") or []:
-        lines.append(
-            f"  {example['id']} 图={example['has_image']} 查询={example['query']} 文档={example['doc']}"
-        )
-    return "\n".join(lines)
+def _compact_architecture(architecture):
+    compact = {k: v for k, v in architecture.items() if k != "layers"}
+    compact["layer_kind_counts"] = dict(Counter(str(layer.get("kind", "unknown")) for layer in architecture.get("layers", [])))
+    return compact
+
+
+def _compact_case(case, grades, limit=8):
+    result = {k:v for k,v in case.items() if k not in {"head_attr", "mlp_attr", "lens"}}
+    writes = []
+    for layer, heads in enumerate(case.get("head_attr") or []):
+        for head, value in enumerate(heads or []):
+            if value is not None:
+                writes.append({"layer": layer, "head": head, "kind": "head", "attribution": value})
+    for layer, value in enumerate(case.get("mlp_attr") or []):
+        if value is not None:
+            writes.append({"layer": layer, "kind": "mlp", "attribution": value})
+    result["top_readout_components"] = sorted(writes, key=lambda c: abs(c["attribution"]), reverse=True)[:limit]
+    result["omitted_component_count"] = max(0, len(writes)-limit)
+    lens = case.get("lens") or []
+    result["final_grade_logits"] = lens[-1].get("logits") if lens else None
+    pred, gold = case.get("pred"), case.get("label")
+    if pred in grades and gold in grades:
+        pi, gi = grades.index(pred), grades.index(gold)
+        result["lens_logit_diff"] = [{"layer": row["layer"], "value": row["logits"][pi]-row["logits"][gi]}
+                                     for row in lens if "logits" in row]
+    return result
+
+
+def build_group_prompt(*, architecture, grades, grade_ids, group, mech, hypotheses,
+                       delta_top, template, budget_tokens, chars_per_token,
+                       token_attr=None, probes=None, verifications=None,
+                       grade_mode="single_token", decode_protocol="constrained", delta_report=None):
+    observations = []
+    def observe(eid, kind, data):
+        observations.append({"evidence_id": eid, "kind": kind, "data": data})
+    observe("decision", "measurement", {"group": group["key"], "n": group["count"],
+            "n_detail": group["n_detail"], "detail_ids": group.get("detail_ids", []),
+            "mean_probs": group.get("mean_probs"), "grade_mass": mech.get("grade_mass"),
+            "full_top_grade_rate": mech.get("full_top_grade_rate"), "logit_diff_mean": mech.get("logit_diff_mean"),
+            "readout_kind": mech.get("readout_kind"), "reconstruction_error": mech.get("reconstruction_error"),
+            "attribution_reliable": mech.get("attribution_reliable"), "decomposition_gap": mech.get("decomposition_gap")})
+    for result in verifications or []:
+        observe("verification:"+result["key"], "intervention", result)
+    observe("controls_and_limits", "limitations", {
+        "causal_restoration_tested": False,
+        "selection_disjoint": bool(verifications) and all(v.get("selection_disjoint", False) for v in verifications),
+        "controls_present": any(v.get("control_type") in {"identity", "random"} and not v.get("skipped") and v.get("mean_delta") is not None for v in verifications or []),
+        "grade_mode": grade_mode, "decode_protocol": decode_protocol,
+        "first_token_note": "首 token 分类不等于完整等级生成或序列似然；本轮未测后续 token。" if grade_mode == "first_token" else None,
+        "baseline_note": "权重基座不是正确行为的保证；未运行基座行为对照。",
+        "base_grade_alignment": (delta_report or {}).get("base_grade_alignment")})
+    for case in mech.get("case_evidence") or []:
+        observe("case:" + str(case["id"]), "per_case_measurement", _compact_case(case, grades))
+    for c in mech.get("components") or []:
+        observe("component:"+c["key"], "readout_attribution", c)
+    observe("token_attribution", "local_gradient", token_attr or {"missing": True})
+    observe("lens", "readout_measurement", mech.get("lens") or [])
+    observe("delta", "weight_geometry", _compact_delta(delta_top, ((delta_report or {}).get("base_grade_alignment") or {}).get("status", "aligned") == "aligned"))
+    if delta_report is not None:
+        grade_report = delta_report.get("lm_head_grades") or {}
+        observe("lm_head_grades", "weight_geometry", {
+            "tied_lm_head": delta_report.get("tied_lm_head"),
+            "rows": {grade: {k:v for k,v in row.items() if k != "delta_vector"}
+                     for grade, row in grade_report.get("rows", {}).items()},
+            "delta_row_cosine": grade_report.get("delta_row_cosine"),
+            "base_source": grade_report.get("base_source"), "missing_reason": grade_report.get("missing_reason")})
+    observe("delta_activations", "local_weight_write", mech.get("delta_contributions") or [])
+    observe("probes", "descriptive_probe", probes or {"missing": True})
+    observe("examples", "input_excerpt", group.get("examples") or [])
+    interpretations = [{"key": h["key"], "status": h["status"], "claim": h["title"],
+                        "evidence_ids": h.get("evidence_ids", []), "evidence": h.get("evidence"),
+                        "evidence_strength": h.get("evidence_strength", h["status"]),
+                        "proposal": h.get("patch"), "proposal_tested": h.get("proposal_tested", False),
+                        "diagnostic_only": h.get("diagnostic_only", False), "diagnostic_patch": h.get("diagnostic_patch")} for h in hypotheses]
+    predictions = [{"key": h["key"], "would_refute": h.get("would_refute")} for h in hypotheses]
+    packet = {"schema_version": 1, "group": group["key"],
+              "protocol": {"grades": grades, "grade_ids": grade_ids, "grade_mode": grade_mode,
+                           "decode_protocol": decode_protocol, "template": template},
+              "architecture": architecture, "observations": observations,
+              "interpretations": interpretations, "predictions": predictions}
+    header = f"""任务。分析相关性模型混淆组 {group['key']}，引用 evidence_id 提出可证伪的机制解释与最小补丁。
+协议：grade_mode={grade_mode}，decode_protocol={decode_protocol}；等级 ID={json.dumps(grade_ids, ensure_ascii=False)}。
+输入模板：{template}
+架构：{json.dumps(_compact_architecture(architecture), ensure_ascii=False)}
+最终 norm DLA 是固定观测 RMS 分母的读出分解，不是总因果效应。pre-norm proxy 不得当真实 logit 贡献。
+消融有效不等于根因已验证；检查作用位置、随机/identity 对照和选择/验证是否独立。lm_head 行混合会代数性压缩分差，不证明根因；共享行编辑还会改变输入 embedding。
+数量比例、注意力份额、梯度归因不可互换。SVD 几何方向缺少 v dot x 时不能解释某个样本的效应。探针只说明可读出性。
+修复率和回退率是不同条件率，不可直接比较净收益；需独立验收与预设回退上限。不要建议梯度训练，不要通过全局缩放或修改 final RMSNorm 调整分布。不得声称未经校准的概率置信度。"""
+    ask = """请先说明支持与反证，再给 JSON：
+{"group":"金标->预测","mechanism":"待验证解释","evidence_ids":[],"components":[],"minimal_fix":null,"verification":"独立验收与对照方案","would_refute":"可证伪观察","evidence_strength":"不足|描述性|干预有效","insufficient_evidence":true}
+每条解释必须引用可见 evidence_id；缺失对照时说明限制。minimal_fix 可用 head_scale、mlp_zero（定位用途）、steering、lm_head_blend；未知共享权重语义时不建议行编辑。不要把缺失或失败的实验写成通过。"""
+    # Controls/refutations precede optional explanatory detail. Required material
+    # remains valid JSON; budget trimming never slices an observation in half.
+    required_observations = [o for o in observations if o["evidence_id"] in {"decision", "controls_and_limits"}]
+    parts = [{"name":"header", "text":header, "droppable":False},
+             {"name":"core", "text":json.dumps(required_observations, ensure_ascii=False), "droppable":False,
+              "provides":[o["evidence_id"] for o in required_observations]}]
+    def priority(observation):
+        if observation["kind"] == "intervention":
+            return 0
+        if observation["evidence_id"] in {"token_attribution", "lens", "delta", "lm_head_grades", "delta_activations", "probes"}:
+            return 1
+        if observation["kind"] == "readout_attribution":
+            return 2
+        return 4 if observation["evidence_id"] == "examples" else 3
+    ordered = sorted([o for o in observations if o not in required_observations], key=priority)
+    for o in ordered:
+        parts.append({"name":o["evidence_id"], "text":json.dumps(o, ensure_ascii=False), "droppable":True})
+    for interpretation, prediction in zip(interpretations, predictions):
+        parts.append({"name":"interpretation:"+interpretation["key"],
+                      "text":json.dumps({"interpretation":interpretation,"prediction":prediction},ensure_ascii=False),
+                      "droppable":True, "requires":interpretation["evidence_ids"]})
+    parts.append({"name":"ask", "text":ask, "droppable":False})
+    text, dropped = fit_budget(parts, budget_tokens, chars_per_token)
+    visible = [o["evidence_id"] for o in observations if o["evidence_id"] not in dropped]
+    return {"group":group["key"], "text":text, "dropped":dropped,
+            "estimated_tokens":estimate_tokens(text,chars_per_token), "evidence_packet":packet,
+            "prompt_evidence_ids":visible}

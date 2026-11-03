@@ -117,8 +117,19 @@ def _top_tokens(score, text_mask, input_ids, tokenizer, limit: int) -> list[dict
                 token = f"#{token_id}"
         else:
             token = f"#{token_id}"
+        raw_token = str(token)
+        decode = getattr(tokenizer, "decode", None)
+        context = None
+        if callable(decode):
+            try:
+                token = decode([token_id], skip_special_tokens=False)
+                context = decode(input_ids[max(0, position-2):position+3].tolist(), skip_special_tokens=False)
+            except (TypeError, ValueError):
+                pass
+        if not token or "\ufffd" in str(token):
+            token = raw_token
         token = str(token).replace("\n", "\\n")
         if len(token) > 24:
             token = token[:24] + "…"
-        rows.append({"position": position, "id": token_id, "token": token, "score": float(values[pick])})
+        rows.append({"position": position, "id": token_id, "token": token, "display": token, "raw_token": raw_token, "context": context, "score": float(values[pick])})
     return rows

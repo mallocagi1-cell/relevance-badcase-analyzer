@@ -128,14 +128,23 @@ def _classify_split(features: np.ndarray, target: np.ndarray) -> dict:
         for column in range(train_y.shape[1]):
             weight_parts.append(np.linalg.solve(gram, centered.T @ (train_y[:, column] - train_y[:, column].mean())))
         weight = np.stack(weight_parts, axis=1)
-        scores = (eval_x - mean) @ weight
+        scores = (eval_x - mean) @ weight + train_y.mean(axis=0)
         return scores.argmax(axis=1)
 
     train_acc = float((fit_predict(features, eye, features) == target).mean())
     heldout = None
+    majority_heldout = None
+    coverage = None
     if n_rows >= 8:
         perm = np.random.default_rng(0).permutation(n_rows)
         cut = n_rows // 2
         pred = fit_predict(features[perm[:cut]], eye[perm[:cut]], features[perm[cut:]])
         heldout = float((pred == target[perm[cut:]]).mean())
-    return {"accuracy_train": train_acc, "accuracy_heldout": heldout, "n": int(n_rows), "underdetermined": n_rows < dim}
+        majority = int(np.bincount(target[perm[:cut]], minlength=classes).argmax())
+        majority_heldout = float((target[perm[cut:]] == majority).mean())
+        coverage = {"train": np.unique(target[perm[:cut]]).tolist(), "test": np.unique(target[perm[cut:]]).tolist()}
+    return {"accuracy_train": train_acc, "accuracy_heldout": heldout, "n": int(n_rows), "underdetermined": n_rows < dim,
+            "majority_baseline": majority_heldout, "majority_baseline_scope": "heldout (training majority predictor)",
+            "majority_accuracy_train": float(np.bincount(target).max()/n_rows), "majority_accuracy_heldout": majority_heldout,
+            "class_coverage": coverage, "n_train": n_rows//2 if n_rows >= 8 else n_rows,
+            "n_test": n_rows - n_rows//2 if n_rows >= 8 else 0, "causal": False}

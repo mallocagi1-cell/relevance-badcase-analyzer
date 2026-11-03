@@ -16,12 +16,20 @@ dependencies = [
   "PyYAML>=6",
   "matplotlib>=3.7",
   "tqdm>=4.66",
-  "transformers>=4.51",
+  # Qwen3.5 classes (Qwen3_5ForConditionalGeneration, Qwen3VLProcessor) exist from transformers 5.x;
+  # the suite is run against 5.22.1. The CPU path needs nothing else.
+  "transformers>=5.22",
   "safetensors>=0.4",
+  # Real images go to the model's own processor as PIL images.
+  "pillow>=10",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+# Optional CUDA kernels for GatedDeltaNet layers (flash-linear-attention, causal-conv1d). Without
+# them transformers falls back to a correct but slower PyTorch implementation. These need a matching
+# CUDA toolchain, so they are not installed by default:
+#   pip install flash-linear-attention causal-conv1d
 
 [project.scripts]
 rba = "rba.cli:main"
