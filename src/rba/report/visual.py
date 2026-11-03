@@ -50,6 +50,7 @@ _T = {
         "not_eval": "未评估", "recommend": "建议",
         "detail": "完整文字版（含全部证据表与方法说明）见同目录 report_detail.html / report.md。",
         "lead_hdr": "先看这里",
+        "s7": "7. 方法原理",
     },
     "en": {
         "title": "Badcase diagnosis — visual report",
@@ -82,6 +83,7 @@ _T = {
         "not_eval": "not evaluated", "recommend": "Recommendation",
         "detail": "Full text version: report_detail.html / report.md in the same folder.",
         "lead_hdr": "Read this first",
+        "s7": "7. How each signal is computed",
     },
 }
 
@@ -443,7 +445,7 @@ def render_visual(report: dict, run_dir: Path, config: dict, lang: str = "zh") -
         search = _e(f"{cid} {row.get('query', '')} {row.get('doc', '')}".lower())
         cards.append(
             f"<div class='card' data-id='{_e(cid)}' data-group='{_e(gkey)}' data-wrong='{int(wrong)}' "
-            f"data-ppred='{(p_pred or 0):.6f}' data-flip='{fl if fl is not None else 999}' data-err='{_err(gold, pred)}' data-search='{search}'>"
+            f"data-ppred='{(p_pred or 0):.6f}' data-flip='{fl if fl is not None else 999}' data-err='{_err(gold, pred)}' data-search='{search}' id='{_case_anchor(cid)}'>"
             f"<div class='ch'><b>{_e(cid)}</b> <span class='tag {'bad' if wrong else 'ok'}'>{t['gold']} {_e(gold)} → {t['pred']} {_e(pred)}</span></div>"
             f"<div class='row'>{img_html}<div class='grow'><p><span class='k'>{t['query']}</span> {q_html}</p>"
             f"<p><span class='k'>{t['doc']}</span> {d_html}</p></div><div class='probs'>{prob_bars}</div></div>"
@@ -550,7 +552,10 @@ def render_visual(report: dict, run_dir: Path, config: dict, lang: str = "zh") -
     sections.append(f"<section id='s6'><h2>{t['s6']}</h2><h3>{t['lead_hdr']}</h3><p>{_e(report.get('lead'))}</p>{''.join(hyp)}"
                     f"<p class='muted'>{_e(t['detail'])}</p></section>")
 
-    nav = "".join(f"<a href='#s{i}'>{_e(t['s' + str(i)])}</a>" for i in range(1, 7))
+    # ---------------------------------------------------------------- 7 method
+    sections.append(_method_section(report, config, groups, mech, tok, verify, t, zh))
+
+    nav = "".join(f"<a href='#s{i}'>{_e(t['s' + str(i)])}</a>" for i in range(1, 8))
     return (
         f"<!DOCTYPE html><html lang='{'zh' if zh else 'en'}'><head><meta charset='utf-8'/>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
@@ -668,6 +673,7 @@ def write_eval_report(result: dict, out_dir: Path, language: str = "zh") -> Path
 
 
 _CSS = """
+table.method td{vertical-align:top;font-size:13px}svg.flow{max-width:900px;display:block;margin:4px 0 10px}
 body{font-family:"Noto Sans SC","PingFang SC","Source Han Sans SC",sans-serif;margin:0;background:#f6f4ef;color:#1c1917}
 nav{position:sticky;top:0;background:#1c1917;padding:8px 16px;z-index:5}nav a{color:#fafaf9;margin-right:16px;text-decoration:none;font-size:14px}
 main{max-width:1180px;margin:0 auto;padding:20px 20px 80px;line-height:1.5}
@@ -711,3 +717,133 @@ cards.forEach(function(c){var ok=(!gv||c.dataset.group===gv)&&(!qv||c.dataset.se
 n.textContent=shown+' / '+cards.length;}
 g.onchange=s.onchange=apply;q.oninput=apply;apply();})();
 """
+
+
+# --------------------------------------------------------------------------- method section
+
+def _case_anchor(cid) -> str:
+    # Hex of the UTF-8 id: stable, HTML-safe and collision-free (different ids never share an anchor).
+    return "case-" + str(cid).encode("utf-8").hex()
+
+
+def _svg_flow(steps: list[tuple[str, str]], color: str, width: int = 860) -> str:
+    """Horizontal box-and-arrow diagram; plain inline SVG, no external refs."""
+    n = max(1, len(steps))
+    gap = 18
+    w = (width - gap * (n - 1)) / n
+    parts = [f"<svg class='flow' viewBox='0 0 {width} 74' width='100%' role='img' aria-label='{_e(" → ".join(t for t, _ in steps))}'>"]
+    for i, (title, sub) in enumerate(steps):
+        x = i * (w + gap)
+        parts.append(f"<rect x='{x:.1f}' y='4' width='{w:.1f}' height='64' rx='8' fill='#fff' stroke='{color}' stroke-width='1.5'/>"
+                     f"<text x='{x + w / 2:.1f}' y='30' text-anchor='middle' font-size='13' font-weight='600'>{_e(title)}</text>"
+                     f"<text x='{x + w / 2:.1f}' y='51' text-anchor='middle' font-size='11' fill='#4b5563'>{_e(sub)}</text>")
+        if i < n - 1:
+            ax = x + w
+            parts.append(f"<path d='M{ax + 2:.1f} 36 L{ax + gap - 3:.1f} 36' stroke='{color}' stroke-width='1.6'/>"
+                         f"<path d='M{ax + gap - 8:.1f} 31 L{ax + gap - 2:.1f} 36 L{ax + gap - 8:.1f} 41 Z' fill='{color}'/>")
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+_METHOD_FLOWS = {
+    "zh": [
+        ("归因：ΔW 先算，lens+DLA 同一次捕获前向，token 归因另做梯度前向", "#7c3aed", [
+            ("分组", "金标→预测"), ("ΔW / SVD", "σ(v·x)(u·d')"), ("logit lens", "norm→W_U[等级]"),
+            ("DLA", "写入 c · d'"), ("token 归因", "层0输入 ∇×h")]),
+        ("排查：一次只动一个组件，看分差是否下降", "#0891b2", [
+            ("候选", "DLA 前 k 个"), ("干预", "head×0 / MLP=0"), ("对照", "随机同类·identity"),
+            ("度量", "Δ(pred−gold)"), ("状态", "n≥4·均值<−1e-4·≥60%")]),
+        ("编辑：补丁 → 复评 → 二选一：导出（+等价性）或 微调", "#16a34a", [
+            ("补丁", "临时前向/权重行干预"), ("rba eval", "修复率/回退率"), ("rba export", "烘焙进权重"),
+            ("等价性", "钩子 vs 导出"), ("或 rba finetune", "CE+hinge+KL")]),
+    ],
+    "en": [
+        ("Attribution: ΔW first, lens+DLA in one capture, token attr in gradient passes", "#7c3aed", [
+            ("Group", "gold→pred"), ("ΔW / SVD", "σ(v·x)(u·d')"), ("Logit lens", "norm→W_U[grades]"),
+            ("DLA", "write c · d'"), ("Token attr", "∇×h at layer 0")]),
+        ("Diagnosis: intervene on one component at a time", "#0891b2", [
+            ("Candidates", "top-k DLA"), ("Intervene", "head×0 / MLP=0"), ("Controls", "random peer·identity"),
+            ("Measure", "Δ(pred−gold)"), ("Status", "n≥4·mean<−1e-4·≥60%")]),
+        ("Editing: patch → eval → export (+equivalence) or finetune", "#16a34a", [
+            ("Patch", "inference hook"), ("rba eval", "fix/regression"), ("rba export", "bake weights"),
+            ("Equivalence", "hook vs export"), ("or rba finetune", "CE+hinge+KL")]),
+    ],
+}
+
+
+def _method_section(report: dict, config: dict, groups: list[dict], mech: dict, tok: dict, verify: dict, t: dict, zh: bool) -> str:
+    lang = "zh" if zh else "en"
+    flows = "".join(f"<h3>{_e(title)}</h3>{_svg_flow(steps, color)}" for title, color, steps in _METHOD_FLOWS[lang])
+    first_mech = next(iter(mech), None)
+    first_tok = next(iter(tok), None)
+    tok_methods = sorted({str(r.get("method")) for r in (tok or {}).values() if isinstance(r, dict) and r.get("method")})
+    method = "/".join(tok_methods) or str(config.get("token_attr_method") or "gradxinput")
+    steps = config.get("ig_steps")
+    steps_txt = str(steps) if steps is not None else "?"
+
+    def _rel(g):
+        ok = g.get("attribution_reliable")
+        err = g.get("reconstruction_error")
+        err_txt = f"{err:.2g}" if isinstance(err, (int, float)) else "—"
+        flag = ("可靠" if ok else "不可靠") if zh else ("reliable" if ok else "unreliable")
+        if ok is None:
+            flag = "—"
+        return f"{g.get('key')}: {flag}（{err_txt}）" if zh else f"{g.get('key')}: {flag} ({err_txt})"
+    rel = [_rel(g) for g in groups if "attribution_reliable" in g or "reconstruction_error" in g]
+    gaps = [f"{g.get('key')}: {g['decomposition_gap']:.3g}" for g in groups if isinstance(g.get("decomposition_gap"), (int, float))]
+    checks = [r for rows in (verify or {}).values() if isinstance(rows, list) for r in rows if isinstance(r, dict)]
+    by_type: dict[str, int] = {}
+    n_skipped = sum(1 for r in checks if r.get("skipped"))
+    for r in checks:
+        if r.get("skipped"):
+            continue
+        by_type[str(r.get("control_type", "target"))] = by_type.get(str(r.get("control_type", "target")), 0) + 1
+    statuses: dict[str, int] = {}
+    for g in groups:
+        for h in g.get("hypotheses") or []:
+            statuses[str(h.get("status"))] = statuses.get(str(h.get("status")), 0) + 1
+    dw = report.get("delta_w") or {}
+    delta = bool(dw.get("top") or dw.get("n_tensors") or (dw.get("lm_head_grades") or {}).get("rows"))
+
+    def link(cid, label):
+        return f"<a href='#{_case_anchor(cid)}'>{_e(label)}</a>" if cid is not None else ""
+
+    if zh:
+        ig_desc = ("积分梯度：基线 0 → 真实输入，α=s/steps（s=1..steps，共 {} 步）取梯度平均，再乘输入。".format(steps_txt)
+                   if method == "integrated_gradients" else "grad×input（默认，等于只取 α=1 的一步）。")
+        rows = [
+            ("logit lens", "每层输出 h_ℓ（决策位置）→ 模型自己的 final_norm → lm_head 的等级行 → softmax；最后一层必须与真实输出一致。",
+             f"{len(mech)} 条有逐层明细", "#s2", link(first_mech, f"例：{first_mech}")),
+            ("DLA 组件归因", "d = W_U[pred] − W_U[gold]；每个头（o_proj/out_proj 输入按头切）和每个 MLP 的写入 c 贡献 c·d。"
+             "norm-aware 版冻结最终 RMS 分母、乘 norm 增益。正 = 推向错误预测。",
+             "读出重建（误差≤τ·(1+|分差|) 为可靠）：" + ("；".join(rel) if rel else "—")
+             + ("；pre-norm 结构差距（>0.15 仅告警）" + "，".join(gaps) if gaps else ""), "#s3", ""),
+            ("token 归因", f"分数 = logit[pred] − logit[gold]，对层 0 输入（视觉塔已写入图像 token）求梯度；{ig_desc}"
+             "image = input_ids == image_token_id，其余非 pad 为文本。", f"方法 {method}，{len(tok)} 条", "#s2", link(first_tok, f"例：{first_tok}")),
+            ("干预复核", "对 DLA 前 k 个组件逐个干预（头 scale=0 / MLP 清零，默认只在决策位置），另跑随机同类组件（头取同层其它头，MLP 取其它层 MLP）与 identity(scale=1，仅头) 对照；"
+             "度量 Δ = (pred−gold)_后 − (pred−gold)_前，Δ<0 为改善。",
+             f"复核记录 {len(checks)} 条：执行 " + ("，".join(f"{k} {v}" for k, v in sorted(by_type.items())) or "0")
+             + f"，跳过 {n_skipped}；状态 "
+             + ("，".join(f"{k} {v}" for k, v in statuses.items()) or "—"), "#s5", ""),
+            ("ΔW / SVD", "ΔW = W_ft − W_base；rel = ‖ΔW‖/‖W_base‖；对 top 的二维权重做 SVD；写残差流的再用 u_k·d' 投影到错误方向（vocab 型看 u_k[pred]−u_k[gold]）；lm_head 等级行看余弦（需基座词表对齐）。几何证据不是因果。",
+             "有 ΔW 数据" if delta else "无可用 ΔW 数据（未提供基座、配置关闭或无可比较项）", "#s4", ""),
+        ]
+        head = ("信号", "代码里怎么算", "本次运行", "看哪里")
+        note = "完整推导、mermaid 流程图与决策树见仓库 docs/方法图解.md。"
+    else:
+        ig_desc = f"integrated gradients, {steps} steps from a zero baseline.".replace(str(steps), steps_txt) if method == "integrated_gradients" else "grad×input (default, one step at α=1)."
+        rows = [
+            ("logit lens", "Each layer output at the decision position → final_norm → grade rows of lm_head → softmax.", f"{len(mech)} cases", "#s2", link(first_mech, str(first_mech))),
+            ("DLA", "d = W_U[pred] − W_U[gold]; each head/MLP write c contributes c·d (norm-aware variant freezes the final RMS).",
+             "readout reconstruction: " + ("; ".join(rel) if rel else "—"), "#s3", ""),
+            ("Token attribution", f"score = logit[pred] − logit[gold], gradient at the layer-0 input; {ig_desc}", f"{method}, {len(tok)} cases", "#s2", link(first_tok, str(first_tok))),
+            ("Verification", "Ablate one top-k component at a time (decision position) with random and identity controls; Δ<0 means the error margin shrank.",
+             f"{len(checks)} records ({n_skipped} skipped)", "#s5", ""),
+            ("ΔW / SVD", "ΔW = W_ft − W_base, relative norm, SVD of residual writers projected onto W_U. Geometry, not causation.", "yes" if delta else "no usable ΔW data", "#s4", ""),
+        ]
+        head = ("Signal", "How the code computes it", "This run", "Where")
+        note = "Full derivation and diagrams: docs/方法图解.md in the repository."
+    body = "".join(
+        f"<tr><td><b>{_e(a)}</b></td><td>{_e(b)}</td><td>{_e(c)}</td><td><a href='{d}'>{_e(t.get(d.lstrip('#'), d))}</a><br/>{e}</td></tr>" for a, b, c, d, e in rows)
+    table = f"<table class='method'><thead><tr>{''.join(f'<th>{_e(h)}</th>' for h in head)}</tr></thead><tbody>{body}</tbody></table>"
+    return f"<section id='s7'><h2>{_e(t['s7'])}</h2>{flows}{table}<p class='muted'>{_e(note)}</p></section>"

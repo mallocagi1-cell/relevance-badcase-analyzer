@@ -110,7 +110,8 @@ def bake_patch(model, resolved, patch: dict, grade_ids: dict[str, int]) -> dict:
             if proj_info is None:
                 raise RBAError(f"第 {index} 层的注意力输出没法按头切开，不能烘焙 head_scale。", "换一个补丁。")
             proj, head_dim, n_heads = proj_info
-            heads = [int(h) for h in patch["heads"]]
+            # Deduplicate like interventions.scale_heads so the baked edit equals the hook.
+            heads = sorted({int(h) for h in patch["heads"]})
             bad = [h for h in heads if h < 0 or h >= n_heads]
             if bad:
                 raise RBAError(f"第 {index} 层没有头 {bad}（共 {n_heads} 个头）。", "头的编号从 0 开始。")

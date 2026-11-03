@@ -1126,7 +1126,8 @@ def _decision_position_patch(model, resolved, patch: dict, grade_ids, index: tor
         if proj_info is None:
             raise RBAError(f"第 {layer_index} 层的注意力输出没法按头切开。", "这一层不做 head_scale 复核。")
         proj, head_dim, n_heads = proj_info
-        heads = [int(h) for h in patch["heads"]]
+        # Same semantics as interventions.scale_heads: a head listed twice is scaled once.
+        heads = sorted({int(h) for h in patch["heads"]})
         bad = [h for h in heads if h < 0 or h >= n_heads]
         if bad:
             raise RBAError(f"第 {layer_index} 层没有头 {bad}（共 {n_heads} 个头）。", "头的编号从 0 开始。")
@@ -1386,7 +1387,7 @@ def _annotate_fraction(hypotheses, model, resolved, n_parameters: int) -> None:
             if info_proj is None:
                 continue
             proj, head_dim, _n = info_proj
-            touched = len(patch["heads"]) * head_dim * proj.weight.shape[0]
+            touched = len({int(h) for h in patch["heads"]}) * head_dim * proj.weight.shape[0]
             item["weight_fraction"] = touched / n_parameters
         elif patch.get("method") == "lm_head_blend":
             item["weight_fraction"] = resolved.lm_head(model).weight.shape[1] / n_parameters

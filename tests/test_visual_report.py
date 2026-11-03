@@ -121,3 +121,41 @@ def test_report_missing_run_dir_is_friendly(tmp_path: Path):
     with pytest.raises(SystemExit) as exc:
         main(["report", str(tmp_path)])
     assert exc.value.code == 2
+
+
+def test_method_section_explains_signals_and_links_cases(demo_run: Path):
+    text = (demo_run / "report.html").read_text(encoding="utf-8")
+    assert "<section id='s7'>" in text and "7. 方法原理" in text and "href='#s7'" in text
+    section = text.split("<section id='s7'>", 1)[1].split("</section>", 1)[0]
+    assert section.count("<svg class='flow'") == 3
+    for word in ("logit lens", "DLA", "token 归因", "干预复核", "ΔW / SVD", "W_U[pred] − W_U[gold]"):
+        assert word in section
+    # every in-page link in the method section resolves to an element in the page
+    ids = set(re.findall(r"id='([^']+)'", text))
+    targets = re.findall(r"href='#([^']+)'", section)
+    assert targets and all(target in ids for target in targets)
+    assert any(target.startswith("case-") for target in targets)
+    assert not re.search(r"https?://", section)
+
+
+def test_case_anchor_is_safe():
+    from rba.report.visual import _case_anchor
+
+    anchors = [_case_anchor(c) for c in ("b 01/x'y", "样本一", "样本二", "a/b", "a b", "a_b", 7)]
+    assert len(set(anchors)) == len(anchors)
+    assert all(re.fullmatch(r"case-[0-9a-f]+", a) for a in anchors)
+    assert _case_anchor("a_b") == _case_anchor("a_b")
+
+
+def test_method_section_reports_run_state_honestly():
+    from rba.report.visual import _T, _method_section
+
+    t = _T["zh"]
+    empty_dw = {"delta_w": {"top": [], "lm_head_grades": {"rows": {}}}}
+    groups = [{"key": "3→1", "attribution_reliable": False, "reconstruction_error": 0.3, "decomposition_gap": 0.01}]
+    tok = {"c1": {"method": "integrated_gradients"}}
+    verify = {"3→1": [{"control_type": "target", "mean_delta": -1.0}, {"control_type": "target", "skipped": "x"}]}
+    html = _method_section(empty_dw, {}, groups, {}, tok, verify, t, True)
+    assert "有 ΔW 数据" not in html and "无可用 ΔW 数据" in html
+    assert "integrated_gradients" in html and "None" not in html
+    assert "不可靠" in html and "跳过 1" in html
