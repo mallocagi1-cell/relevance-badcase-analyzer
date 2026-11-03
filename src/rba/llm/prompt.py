@@ -6,6 +6,16 @@ from collections import Counter
 from rba.errors import RBAError
 
 
+LANGUAGE_INSTRUCTIONS = {
+    "zh": "请全部用中文回答：分析过程和 JSON 里的文字字段（mechanism、verification、would_refute 等）都用中文；JSON 键名保持英文；logit lens、DLA、ΔW、SVD、lm_head、head_scale 等技术术语和 evidence_id 保留原文。",
+    "en": "Answer in English. Keep JSON keys and evidence_id values unchanged.",
+}
+
+
+def language_instruction(language: str = "zh") -> str:
+    return LANGUAGE_INSTRUCTIONS.get(language, LANGUAGE_INSTRUCTIONS["zh"])
+
+
 def estimate_tokens(text: str, chars_per_token: float) -> int:
     return max(1, int(len(text) / max(chars_per_token, .5)))
 
@@ -82,7 +92,8 @@ def _compact_case(case, grades, limit=8):
 def build_group_prompt(*, architecture, grades, grade_ids, group, mech, hypotheses,
                        delta_top, template, budget_tokens, chars_per_token,
                        token_attr=None, probes=None, verifications=None,
-                       grade_mode="single_token", decode_protocol="constrained", delta_report=None):
+                       grade_mode="single_token", decode_protocol="constrained", delta_report=None,
+                       language="zh"):
     observations = []
     def observe(eid, kind, data):
         observations.append({"evidence_id": eid, "kind": kind, "data": data})
@@ -142,6 +153,7 @@ def build_group_prompt(*, architecture, grades, grade_ids, group, mech, hypothes
     ask = """请先说明支持与反证，再给 JSON：
 {"group":"金标->预测","mechanism":"待验证解释","evidence_ids":[],"components":[],"minimal_fix":null,"verification":"独立验收与对照方案","would_refute":"可证伪观察","evidence_strength":"不足|描述性|干预有效","insufficient_evidence":true}
 每条解释必须引用可见 evidence_id；缺失对照时说明限制。minimal_fix 可用 head_scale、mlp_zero（定位用途）、steering、lm_head_blend；未知共享权重语义时不建议行编辑。不要把缺失或失败的实验写成通过。"""
+    ask += "\n" + language_instruction(language)
     # Controls/refutations precede optional explanatory detail. Required material
     # remains valid JSON; budget trimming never slices an observation in half.
     required_observations = [o for o in observations if o["evidence_id"] in {"decision", "controls_and_limits"}]

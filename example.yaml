@@ -31,6 +31,7 @@ token_attr_method: gradxinput
 ig_steps: 2
 chars_per_token: 1.6
 resume: true
+language: zh                    # 分析结论语言：zh（默认）或 en；只影响大模型回答，报告固定中文
 
 llm:
   base_url: https://api.openai.com/v1

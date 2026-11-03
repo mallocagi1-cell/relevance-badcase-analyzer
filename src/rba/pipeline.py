@@ -1313,6 +1313,7 @@ def _build_prompt(cfg, architecture, grades, grade_ids, summary, mech_summary, h
         "grade_mode": cfg.grade_mode,
         "decode_protocol": cfg.decode_protocol,
         "delta_report": delta,
+        "language": getattr(cfg, "language", "zh"),
     }
     for name, value in extra.items():
         if _accepts(build_group_prompt, name):
@@ -1332,7 +1333,7 @@ def _call_llm(cfg: Config, prompts: list[dict], prompt_dir: Path, llm_mode: str)
     for prompt in prompts:
         safe = _safe_name(prompt["group"])
         try:
-            raw = chat(cfg.llm.base_url, cfg.llm.model, cfg.llm.api_key_env, prompt["text"], cfg.llm.temperature, cfg.llm.timeout_s)
+            raw = chat(cfg.llm.base_url, cfg.llm.model, cfg.llm.api_key_env, prompt["text"], cfg.llm.temperature, cfg.llm.timeout_s, getattr(cfg, "language", "zh"))
         except RBAError as exc:
             warn(f"{prompt['group']} 的大模型调用失败：{exc.message}")
             failures.append({"group": prompt["group"], "error": exc.message, "hint": exc.hint, "prompt_file": f"prompts/{safe}.txt"})

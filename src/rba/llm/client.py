@@ -10,7 +10,7 @@ import urllib.request
 from rba.errors import RBAError
 
 
-def chat(base_url: str, model: str, api_key_env: str, prompt: str, temperature: float, timeout_s: float) -> str:
+def chat(base_url: str, model: str, api_key_env: str, prompt: str, temperature: float, timeout_s: float, language: str = "zh") -> str:
     api_key = os.environ.get(api_key_env, "")
     if not api_key:
         raise RBAError(
@@ -24,7 +24,8 @@ def chat(base_url: str, model: str, api_key_env: str, prompt: str, temperature: 
         "messages": [
             {
                 "role": "system",
-                "content": "你在读一份已经压缩过的模型证据。按用户给出的 JSON 结构回答，不要建议重新训练。",
+                "content": "你在读一份已经压缩过的模型证据。按用户给出的 JSON 结构回答，不要建议重新训练。"
+                + ("全部结论用中文写，JSON 键名保持英文，技术术语保留原文。" if language == "zh" else " Answer in English."),
             },
             {"role": "user", "content": prompt},
         ],
