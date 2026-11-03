@@ -277,3 +277,23 @@ def test_finetune_without_peft_says_so(data, tmp_path, monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake)
     with pytest.raises(RBAError, match="peft"):
         finetune(_cfg(data), FinetuneOptions(out=str(tmp_path / "ft"), steps=1))
+
+
+def test_head_scale_with_repeated_head_bakes_like_the_hook():
+    """A head listed twice is scaled once by the hook; bake must match, not scale twice."""
+    from rba.models.paths import resolve_paths
+    from rba.repair.bake import bake_patch
+    from rba.repair.interventions import apply_patch
+
+    tok = build_tokenizer()
+    model = build_model(tok).float()
+    resolved = resolve_paths(model, {}, preset="qwen3_5")
+    grade_ids = {g: tok.convert_tokens_to_ids(g) for g in ["0", "1", "2", "3"]}
+    patch = {"method": "head_scale", "layer": 0, "heads": [0, 0], "scale": 0.5}
+    ids = torch.tensor([[20, 21, 22, 23, 24]])
+    with torch.no_grad(), apply_patch(model, resolved, patch, grade_ids):
+        hooked = model(input_ids=ids).logits
+    bake_patch(model, resolved, patch, grade_ids)
+    with torch.no_grad():
+        baked = model(input_ids=ids).logits
+    assert torch.allclose(hooked, baked, atol=1e-4)
