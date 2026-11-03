@@ -56,6 +56,20 @@ rba analyze --base /path/to/基座模型 --ft /path/to/微调模型 \
 
 最后用 `rba eval` 验收补丁。它报两个数：坏例修复率、好例回退率。两个都看，回退率高的补丁不要用。
 
+## 补丁验收之后：导出或微调
+
+- **`rba export`**：把验收过的补丁直接改进权重，存成标准 Hugging Face 目录，上线不需要 rba。导出后会自动拿新模型和「钩子补丁」逐条对比，预测必须一致，并写一份清单 `rba_export_manifest.json`。
+  ```bash
+  rba export --run runs/xxxx --patch runs/xxxx/patches/3_to_0_h1.json --out exported/
+  ```
+  能导出：head_scale、mlp_zero、lm_head_blend（共享 embedding 时要加 `--untie-embeddings`）、steering（仅当那一层的 down_proj 自带 bias；Qwen3.5 没有，会拒绝）。不能导出：ablate_tokens / ablate_image。只在决策位置复核过的补丁要加 `--allow-all-positions` 才导出。
+- **`rba finetune`**：补丁不够用时，只在分析定位到的层上做 LoRA（或全量）训练，损失只算等级 token；用混淆组做难负例，用对照集回放防回退；最后合并权重，并报告训练前后在留出坏例和留出对照上的修复率 / 回退率。LoRA 需要 `pip install -e '.[finetune]'`。
+  ```bash
+  rba finetune --run runs/xxxx --out runs/xxxx/finetune --dtype bfloat16 --steps 200
+  ```
+
+每个参数、例子和限制见 **[docs/导出与微调.md](docs/导出与微调.md)**。
+
 ## 更多
 
 全部命令和参数、数据格式细节、GPU/bf16 说明、报告各部分含义、方法原理、常见问题和已知限制，见 **[docs/使用说明.md](docs/使用说明.md)**。

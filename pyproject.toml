@@ -26,6 +26,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+# rba finetune --mode lora (default). Not needed for analyze / eval / export.
+finetune = ["peft>=0.13"]
 # Optional CUDA kernels for GatedDeltaNet layers (flash-linear-attention, causal-conv1d). Without
 # them transformers falls back to a correct but slower PyTorch implementation. These need a matching
 # CUDA toolchain, so they are not installed by default:

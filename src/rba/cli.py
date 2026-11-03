@@ -24,6 +24,8 @@ EPILOG = """
   rba analyze --base /path/base --ft /path/ft --badcases bad.jsonl --goodcases good.jsonl
   rba init --base /path/base --ft /path/ft --badcases bad.jsonl
   rba eval --run runs/example --patch runs/example/patches/某组_h1.json
+  rba export --run runs/example --patch runs/example/patches/某组_h1.json --out exported/
+  rba finetune --run runs/example --out runs/example/finetune --steps 200
 
 退出码：0 成功；2 配置或数据错误（已给出建议）；3 分析完成但大模型调用失败；1 程序内部错误（traceback 在输出目录的 error.log）。
 """.strip()
@@ -60,6 +62,44 @@ def main(argv: list[str] | None = None) -> None:
     eval_p.add_argument("--patch", help="分析报告写出的补丁 JSON")
     eval_p.add_argument("--run", help="某次分析的输出目录。会完整恢复那次的配置（模板、等级、解码协议、模块路径等）")
 
+    export_p = sub.add_parser("export", help="把验收过的补丁精确烘焙进权重，存成不依赖 rba 的标准 checkpoint")
+    _add_common(export_p)
+    export_p.add_argument("--run", help="某次分析的输出目录，恢复那次的配置；核对用的样本也来自那次")
+    export_p.add_argument("--patch", nargs="+", required=True, help="一个或多个补丁 JSON，按给出的顺序烘焙")
+    export_p.add_argument("--out", required=True, help="导出目录（会写 config.json、权重、分词器文件和 rba_export_manifest.json）")
+    export_p.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], help="加载、烘焙、保存用的精度。默认沿用配置")
+    export_p.add_argument("--force", action="store_true", help="允许导出未经复核（untested）或被复核否定的补丁")
+    export_p.add_argument("--allow-all-positions", action="store_true", help="允许把只在决策位置复核过的补丁烘焙成作用于所有位置")
+    export_p.add_argument("--untie-embeddings", action="store_true", help="lm_head 与 embedding 共享权重时，拆开后再改 lm_head 行")
+    export_p.add_argument("--tolerance", type=float, help="等价性核对的 logit 容差。默认 float32 1e-3、bfloat16 0.25、float16 0.05")
+    export_p.add_argument("--overwrite", action="store_true", help="--out 已有内容时清空后再写")
+    export_p.add_argument("--check-only", action="store_true", help="只检查补丁能不能烘焙，不写模型")
+
+    ft_p = sub.add_parser("finetune", help="补丁不够时做针对性修复训练（默认 LoRA，只训定位到的层）")
+    _add_common(ft_p)
+    ft_p.add_argument("--run", help="某次分析的输出目录。用它的配置和报告里定位到的层/模块")
+    ft_p.add_argument("--out", required=True, help="输出目录：model/（合并后的 checkpoint）和 finetune.json")
+    ft_p.add_argument("--dtype", choices=["float32", "bfloat16", "float16"], help="训练精度。2B 单卡用 bfloat16")
+    ft_p.add_argument("--mode", choices=["lora", "full"], default="lora", help="lora（默认，需要 peft）或 full（直接训练目标模块的全部权重）")
+    ft_p.add_argument("--targets", choices=["localized", "all"], default="localized", help="localized 只训定位到的层；all 训所有层")
+    ft_p.add_argument("--layers", help="手动指定层号，逗号分隔，例如 3,5。会盖掉报告的定位")
+    ft_p.add_argument("--modules", help="模块名后缀，逗号分隔，例如 o_proj,out_proj,down_proj,lm_head。默认是各层的注意力输出投影和 down_proj")
+    ft_p.add_argument("--extra-train", help="额外训练数据（jsonl/csv，格式同坏例）。只进训练，不进评估")
+    ft_p.add_argument("--steps", type=int, default=100, help="优化步数，默认 100")
+    ft_p.add_argument("--lr", type=float, help="学习率。默认 LoRA 1e-4，full 1e-5")
+    ft_p.add_argument("--train-batch-size", type=int, default=4, help="每步样本数（坏例 + 回放），默认 4")
+    ft_p.add_argument("--lora-r", type=int, default=8, help="LoRA 秩，默认 8")
+    ft_p.add_argument("--lora-alpha", type=float, default=16.0, help="LoRA alpha，默认 16")
+    ft_p.add_argument("--hard-negative-weight", type=float, default=1.0, help="难负例间隔损失的权重，0 表示关掉，默认 1")
+    ft_p.add_argument("--margin", type=float, default=1.0, help="金标 logit 至少要比混淆等级高多少，默认 1")
+    ft_p.add_argument("--replay-ratio", type=float, default=0.5, help="每步里对照回放占的比例，默认 0.5")
+    ft_p.add_argument("--kl-weight", type=float, default=1.0, help="回放样本上贴近原模型等级分布的 KL 权重，默认 1")
+    ft_p.add_argument("--control-holdout", type=float, default=0.5, help="对照集里留作评估、不参与回放的比例，默认 0.5")
+    ft_p.add_argument("--train-holdout", type=float, default=0.3, help="分析时没留验收集时，这次留出多少坏例只做评估，默认 0.3")
+    ft_p.add_argument("--no-balance-groups", action="store_true", help="不按混淆组均衡采样（默认每组被抽到的机会相同）")
+    ft_p.add_argument("--grad-checkpointing", action="store_true", help="梯度检查点，省显存、慢一些")
+    ft_p.add_argument("--overwrite", action="store_true", help="--out 已有内容时清空后再写")
+
     demo = sub.add_parser("demo", help="用内置小模型和样例数据干跑一遍")
     demo.add_argument("--arch", choices=["tiny", "qwen3_5_tiny"], default="tiny", help="tiny 是同结构的替身；qwen3_5_tiny 是真实类的随机小模型")
     demo.add_argument("--output-dir", default="runs/demo")
@@ -88,6 +128,19 @@ def main(argv: list[str] | None = None) -> None:
             path = out / "eval.json"
             path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
             info(f"验收结果：{path}")
+        elif args.cmd == "export":
+            from rba.repair.bake import export_patches
+
+            cfg, _meta = _cfg_from_run_args(args, "export")
+            patches = [(Path(p).name, _load_patch(p)) for p in args.patch]
+            export_patches(cfg, patches, Path(args.out), force=args.force, allow_all_positions=args.allow_all_positions,
+                           untie=args.untie_embeddings, overwrite=args.overwrite, tolerance=args.tolerance, dry_run=args.check_only)
+        elif args.cmd == "finetune":
+            from rba.repair.finetune import FinetuneOptions, finetune
+
+            cfg, _meta = _cfg_from_run_args(args, "finetune")
+            output_hint = Path(args.out)
+            finetune(cfg, _finetune_options(args))
         elif args.cmd == "demo":
             output_hint = Path(args.output_dir)
             _cmd_demo(args)
@@ -202,6 +255,25 @@ def _cfg_from_eval_args(args):
             "验收需要一个补丁。",
             "用分析报告 patches/ 里的 JSON：rba eval --run runs/某次 --patch runs/某次/patches/组_h1.json",
         )
+    cfg, run_meta = _cfg_from_run_args(args, "eval")
+    patch = _load_patch(args.patch)
+    return cfg, patch, run_meta
+
+
+def _load_patch(value: str) -> dict:
+    path = Path(value)
+    if not path.exists():
+        raise RBAError(f"找不到补丁 {path}。", "路径写报告里的那一行，不要手改字段名。")
+    try:
+        patch = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RBAError(f"补丁不是合法 JSON：{exc}", "重新从报告生成，或检查有没有被编辑坏。") from exc
+    if not isinstance(patch, dict) or "method" not in patch:
+        raise RBAError("补丁里没有 method。", "用 head_scale、mlp_zero、steering、lm_head_blend 或 ablate_tokens。")
+    return patch
+
+
+def _cfg_from_run_args(args, what: str):
     run_meta: dict = {}
     if args.run:
         used_path = Path(args.run) / "config.used.json"
@@ -218,7 +290,7 @@ def _cfg_from_eval_args(args):
         cfg = config_from_used(used)
         if args.config:
             raise RBAError("--run 和 --config 不能同时用。", "--run 已经完整恢复那次分析的配置；要换配置就不要传 --run。")
-        if args.output_dir is None:
+        if getattr(args, "output_dir", None) is None and what == "eval":
             args.output_dir = str(Path(args.run) / "eval")
     elif args.config:
         cfg = Config.load(args.config)
@@ -226,25 +298,53 @@ def _cfg_from_eval_args(args):
         if not (args.ft and args.badcases):
             raise RBAError(
                 "验收还缺模型和坏例。",
-                "推荐：rba eval --run 分析目录 --patch 补丁.json。或者：rba eval --ft 微调目录 --badcases 坏例.jsonl --goodcases 对照.jsonl --patch 补丁.json",
+                f"推荐：rba {what} --run 分析目录 ...。或者：rba {what} --ft 微调目录 --badcases 坏例.jsonl --goodcases 对照.jsonl ...",
             )
         cfg = Config()
         cfg.goodcases = None
         if not args.base:
             args.base = args.ft
     cfg = _apply_cli(cfg, args)
+    if getattr(args, "dtype", None):
+        cfg.dtype = args.dtype
     cfg.dry_run = True
     cfg.fresh = False
-    path = Path(args.patch)
-    if not path.exists():
-        raise RBAError(f"找不到补丁 {path}。", "路径写报告里的那一行，不要手改字段名。")
+    return cfg, run_meta
+
+
+def _int_list(value: str | None, flag: str) -> list[int] | None:
+    if not value:
+        return None
     try:
-        patch = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise RBAError(f"补丁不是合法 JSON：{exc}", "重新从报告生成，或检查有没有被编辑坏。") from exc
-    if not isinstance(patch, dict) or "method" not in patch:
-        raise RBAError("补丁里没有 method。", "用 head_scale、mlp_zero、steering、lm_head_blend 或 ablate_tokens。")
-    return cfg, patch, run_meta
+        return [int(v) for v in value.split(",") if v.strip()]
+    except ValueError as exc:
+        raise RBAError(f"{flag} 要写逗号分隔的整数，收到 {value!r}。", f"例如 {flag} 3,5") from exc
+
+
+def _finetune_options(args):
+    from rba.repair.finetune import FinetuneOptions
+
+    report = None
+    if args.run:
+        path = Path(args.run) / "report.json"
+        if path.exists():
+            report = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            raise RBAError(f"{args.run} 里没有 report.json，拿不到定位结果。", "用 --layers 手动指定层，或指向完整的分析目录。")
+    for flag, value in (("--replay-ratio", args.replay_ratio), ("--control-holdout", args.control_holdout), ("--train-holdout", args.train_holdout)):
+        if not 0.0 <= value < 1.0:
+            raise RBAError(f"{flag} 要在 0 到 1 之间（不含 1），收到 {value}。", f"例如 {flag} 0.5")
+    if args.steps <= 0:
+        raise RBAError("--steps 要大于 0。", "例如 --steps 100")
+    return FinetuneOptions(
+        out=args.out, mode=args.mode, targets=args.targets, layers=_int_list(args.layers, "--layers"),
+        modules=[m.strip() for m in args.modules.split(",") if m.strip()] if args.modules else None,
+        steps=args.steps, lr=args.lr, train_batch_size=args.train_batch_size, lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+        hard_negative_weight=args.hard_negative_weight, margin=args.margin, replay_ratio=args.replay_ratio,
+        kl_weight=args.kl_weight, control_holdout=args.control_holdout, holdout=args.train_holdout, extra_train=args.extra_train,
+        balance_groups=not args.no_balance_groups, grad_checkpointing=args.grad_checkpointing,
+        seed=args.seed or 0, overwrite=args.overwrite, report=report,
+    )
 
 
 def _cmd_demo(args) -> None:
