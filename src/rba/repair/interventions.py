@@ -46,17 +46,17 @@ def scale_heads(model, resolved: ResolvedModel, layer: int, heads: list[int], sc
             "头的编号从 0 开始。",
         )
     original = proj.forward
+    head_set = sorted(set(heads))
 
     def forward(hidden):
-        pieces = []
-        for head in range(n_heads):
+        # Scale the heads' input columns, then call whatever forward was there before.
+        # Linear in the input, so this equals scaling those heads' writes, and two
+        # head_scale patches on the same layer compose instead of overwriting each other.
+        edited = hidden.clone()
+        for head in head_set:
             sl = slice(head * head_dim, (head + 1) * head_dim)
-            factor = scale if head in heads else 1.0
-            pieces.append(nn.functional.linear(hidden[..., sl], proj.weight[:, sl]) * factor)
-        output = torch.stack(pieces, dim=0).sum(dim=0)
-        if proj.bias is not None:
-            output = output + proj.bias
-        return output
+            edited[..., sl] = edited[..., sl] * scale
+        return original(edited)
 
     proj.forward = forward
     try:
